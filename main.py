@@ -9,8 +9,16 @@ import html
 import time
 
 app = FastAPI()
-ai_brief_cache = {}
+
 signals_log = []
+
+# AI cache and decision log.
+ai_brief_cache = {}
+
+# Simple in-memory decision log.
+# Important: this resets after Render restart/redeploy.
+ai_decision_log = []
+MAX_AI_DECISION_LOG_ITEMS = 100
 
 # Public Bybit connection. No API key needed for market data.
 bybit = HTTP(testnet=False)
@@ -24,7 +32,6 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # Cache AI brief to avoid spending money every dashboard refresh.
 AI_CACHE_TTL_SECONDS = int(os.getenv("AI_CACHE_TTL_SECONDS", "600"))
-ai_brief_cache = {}
 
 
 # =====================================================
@@ -48,6 +55,26 @@ def ema(values, length):
         ema_value = price * k + ema_value * (1 - k)
 
     return ema_value
+
+
+def ema_series(values, length):
+    """
+    Returns a list the same length as values.
+    Values before enough data are None.
+    """
+    if len(values) < length:
+        return [None for _ in values]
+
+    result = [None for _ in values]
+    k = 2 / (length + 1)
+    ema_value = sum(values[:length]) / length
+    result[length - 1] = ema_value
+
+    for i in range(length, len(values)):
+        ema_value = values[i] * k + ema_value * (1 - k)
+        result[i] = ema_value
+
+    return result
 
 
 def rsi(values, length=14):
@@ -91,6 +118,15 @@ def atr(candles, length=14):
         true_ranges.append(tr)
 
     return sum(true_ranges[-length:]) / length
+
+
+def fmt_number(value, decimals=2):
+    if value is None:
+        return "-"
+    try:
+        return f"{value:,.{decimals}f}"
+    except Exception:
+        return "-"
 
 
 def get_bybit_candles(symbol="BTCUSDT", interval="60", limit=200):
@@ -576,6 +612,70 @@ Important rules:
         }
 
 
+def log_ai_decision(data, ai_brief):
+    """
+    Store a compact AI decision log item.
+    This is in-memory only. It resets after Render restart/redeploy.
+    """
+
+    brief_text = ai_brief.get("brief", "") if ai_brief else ""
+    brief_preview = brief_text[:700]
+
+    log_key = (
+        f"{data.get('symbol')}:"
+        f"{data.get('interval')}:"
+        f"{data.get('decision')}:"
+        f"{round(data.get('price', 0), 1)}:"
+        f"{data.get('total_score')}:"
+        f"{data.get('smc_score')}:"
+        f"{data.get('action')}"
+    )
+
+    # Avoid duplicate entries caused by dashboard auto-refresh.
+    if ai_decision_log and ai_decision_log[-1].get("log_key") == log_key:
+        return ai_decision_log[-1]
+
+    item = {
+        "log_key": log_key,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "symbol": data.get("symbol"),
+        "interval": data.get("interval"),
+        "price": data.get("price"),
+        "decision": data.get("decision"),
+        "action": data.get("action"),
+        "trend": data.get("trend"),
+        "bias": data.get("bias"),
+        "smc_score": data.get("smc_score"),
+        "technical_score": data.get("technical_score"),
+        "risk_score": data.get("risk_score"),
+        "total_score": data.get("total_score"),
+        "market_structure": data.get("market_structure"),
+        "pd_zone": data.get("pd_zone"),
+        "low_sweep": data.get("low_sweep"),
+        "high_sweep": data.get("high_sweep"),
+        "inside_bullish_fvg": data.get("inside_bullish_fvg"),
+        "inside_bearish_fvg": data.get("inside_bearish_fvg"),
+        "inside_bullish_ob": data.get("inside_bullish_ob"),
+        "inside_bearish_ob": data.get("inside_bearish_ob"),
+        "entry": data.get("entry"),
+        "stop_loss": data.get("stop_loss"),
+        "tp1": data.get("tp1"),
+        "tp2": data.get("tp2"),
+        "tp3": data.get("tp3"),
+        "ai_status": ai_brief.get("status") if ai_brief else None,
+        "ai_model": ai_brief.get("model") if ai_brief else None,
+        "ai_updated_at": ai_brief.get("updated_at") if ai_brief else None,
+        "ai_brief_preview": brief_preview,
+    }
+
+    ai_decision_log.append(item)
+
+    if len(ai_decision_log) > MAX_AI_DECISION_LOG_ITEMS:
+        del ai_decision_log[0:len(ai_decision_log) - MAX_AI_DECISION_LOG_ITEMS]
+
+    return item
+
+
 # =====================================================
 # MAIN ANALYSIS ENGINE
 # =====================================================
@@ -865,6 +965,52 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
 
 
 # =====================================================
+# CHART DATA HELPERS
+# =====================================================
+
+def prepare_chart_payload(symbol="BTCUSDT", interval="60", limit=180):
+    candles = get_bybit_candles(symbol=symbol, interval=interval, limit=limit)
+    closes = [c["close"] for c in candles]
+
+    ema50_values = ema_series(closes, 50)
+    ema200_values = ema_series(closes, 200)
+
+    candle_data = []
+    ema50_data = []
+    ema200_data = []
+
+    for i, c in enumerate(candles):
+        # Bybit timestamp is in milliseconds. Lightweight Charts uses seconds.
+        t = int(c["start_time"] / 1000)
+
+        candle_data.append({
+            "time": t,
+            "open": c["open"],
+            "high": c["high"],
+            "low": c["low"],
+            "close": c["close"],
+        })
+
+        if ema50_values[i] is not None:
+            ema50_data.append({
+                "time": t,
+                "value": ema50_values[i],
+            })
+
+        if ema200_values[i] is not None:
+            ema200_data.append({
+                "time": t,
+                "value": ema200_values[i],
+            })
+
+    return {
+        "candles": candle_data,
+        "ema50": ema50_data,
+        "ema200": ema200_data,
+    }
+
+
+# =====================================================
 # ROUTES
 # =====================================================
 
@@ -878,6 +1024,8 @@ def home():
         "openai_key_configured": OPENAI_API_KEY is not None,
         "ai_model": OPENAI_MODEL,
         "dashboard": "/dashboard",
+        "chart": "/chart",
+        "decision_log": "/decision-log",
     }
 
 
@@ -907,6 +1055,18 @@ def get_signals():
     return {
         "count": len(signals_log),
         "signals": signals_log[-20:],
+    }
+
+
+@app.get("/decision-log")
+def get_decision_log(limit: int = 50):
+    limit = max(1, min(limit, 100))
+
+    return {
+        "status": "ok",
+        "count": len(ai_decision_log),
+        "limit": limit,
+        "items": ai_decision_log[-limit:],
     }
 
 
@@ -948,6 +1108,7 @@ def get_analysis(symbol: str = "BTCUSDT", interval: str = "60", ai: bool = False
 
     if ai and data.get("status") == "ok":
         data["ai_market_brief"] = generate_ai_market_brief(data)
+        log_ai_decision(data, data["ai_market_brief"])
 
     return data
 
@@ -960,12 +1121,33 @@ def get_ai_analysis(symbol: str = "BTCUSDT", interval: str = "60"):
     if data.get("status") != "ok":
         return data
 
+    ai_brief = generate_ai_market_brief(data)
+    log_ai_decision(data, ai_brief)
+
     return {
         "status": "ok",
         "symbol": symbol,
         "interval": interval,
         "analysis": data,
-        "ai_market_brief": generate_ai_market_brief(data),
+        "ai_market_brief": ai_brief,
+    }
+
+
+@app.get("/bybit/chart-data/{symbol}")
+def get_chart_data(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 180):
+    symbol = symbol.upper()
+    limit = max(60, min(limit, 300))
+
+    analysis = analyze_market(symbol=symbol, interval=interval)
+    chart_data = prepare_chart_payload(symbol=symbol, interval=interval, limit=limit)
+
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit,
+        "analysis": analysis,
+        "chart": chart_data,
     }
 
 
@@ -978,12 +1160,13 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
         <html>
         <body>
             <h1>Trading Agent Dashboard</h1>
-            <p>Error: {data.get("message")}</p>
+            <p>Error: {html.escape(str(data.get("message")))}</p>
         </body>
         </html>
         """
 
     ai_brief = generate_ai_market_brief(data)
+    log_ai_decision(data, ai_brief)
 
     decision = data["decision"]
 
@@ -1003,9 +1186,7 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
         decision_color = "#2563eb"
 
     def fmt(value, decimals=2):
-        if value is None:
-            return "-"
-        return f"{value:,.{decimals}f}"
+        return fmt_number(value, decimals)
 
     def yes_no(value):
         return "YES" if value else "NO"
@@ -1028,6 +1209,32 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
     ai_model = ai_brief.get("model") or "not configured"
     ai_updated = ai_brief.get("updated_at")
     ai_text = text_to_html(ai_brief.get("brief", ""))
+
+    decision_log_rows = ""
+    recent_log_items = list(reversed(ai_decision_log[-10:]))
+
+    if recent_log_items:
+        for item in recent_log_items:
+            decision_log_rows += f"""
+                <tr>
+                    <td>{html.escape(str(item.get("created_at", "-")))}</td>
+                    <td>{html.escape(str(item.get("symbol", "-")))}</td>
+                    <td>{html.escape(str(item.get("interval", "-")))}</td>
+                    <td>{fmt(item.get("price"))}</td>
+                    <td>{html.escape(str(item.get("decision", "-")))}</td>
+                    <td>{html.escape(str(item.get("action", "-")))}</td>
+                    <td>{html.escape(str(item.get("smc_score", "-")))}</td>
+                    <td>{html.escape(str(item.get("technical_score", "-")))}</td>
+                    <td>{html.escape(str(item.get("risk_score", "-")))}</td>
+                    <td>{html.escape(str(item.get("total_score", "-")))}</td>
+                </tr>
+            """
+    else:
+        decision_log_rows = """
+            <tr>
+                <td colspan="10">No AI decisions logged yet.</td>
+            </tr>
+        """
 
     html_page = f"""
     <html>
@@ -1112,15 +1319,42 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
             ul {{
                 line-height: 1.7;
             }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 13px;
+            }}
+            th, td {{
+                border-bottom: 1px solid #374151;
+                padding: 8px;
+                text-align: left;
+                vertical-align: top;
+            }}
+            th {{
+                color: #93c5fd;
+                font-weight: bold;
+            }}
+            .top-links {{
+                margin-bottom: 18px;
+            }}
+            .top-links a {{
+                margin-right: 12px;
+            }}
         </style>
     </head>
     <body>
         <div class="container">
             <h1>Trading Agent Dashboard</h1>
 
+            <div class="top-links">
+                <a href="/chart?symbol={html.escape(data["symbol"])}&interval={html.escape(data["interval"])}">Open Visual Chart</a>
+                <a href="/decision-log">Open Decision Log JSON</a>
+                <a href="/bybit/analyze/{html.escape(data["symbol"])}?interval={html.escape(data["interval"])}&ai=true">Open Analysis JSON</a>
+            </div>
+
             <div class="card">
-                <div class="decision">{data["decision"]}</div>
-                <h2>Action: {data["action"]}</h2>
+                <div class="decision">{html.escape(data["decision"])}</div>
+                <h2>Action: {html.escape(data["action"])}</h2>
                 <p class="reason">{html.escape(data["reason"])}</p>
             </div>
 
@@ -1128,6 +1362,30 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                 <h2>AI Market Brief</h2>
                 <div class="ai">{ai_text}</div>
                 <p class="small">AI status: {html.escape(str(ai_status))} | Model: {html.escape(str(ai_model))} | Updated UTC: {html.escape(str(ai_updated))}</p>
+            </div>
+
+            <div class="card">
+                <h2>AI Decision Log</h2>
+                <p class="small">Last 10 logged AI decisions. Full JSON: <a href="/decision-log">Open decision log</a></p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>UTC Time</th>
+                            <th>Symbol</th>
+                            <th>TF</th>
+                            <th>Price</th>
+                            <th>Decision</th>
+                            <th>Action</th>
+                            <th>SMC</th>
+                            <th>Tech</th>
+                            <th>Risk</th>
+                            <th>Total</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {decision_log_rows}
+                    </tbody>
+                </table>
             </div>
 
             <div class="card">
@@ -1153,7 +1411,7 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
             </div>
 
             <div class="card">
-                <h2>{data["symbol"]} / Timeframe: {data["interval"]}</h2>
+                <h2>{html.escape(data["symbol"])} / Timeframe: {html.escape(data["interval"])}</h2>
                 <div class="grid">
                     <div class="item">
                         <div class="label">Current Price</div>
@@ -1161,11 +1419,11 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                     </div>
                     <div class="item">
                         <div class="label">Trend</div>
-                        <div class="value">{data["trend"]}</div>
+                        <div class="value">{html.escape(data["trend"])}</div>
                     </div>
                     <div class="item">
                         <div class="label">Bias</div>
-                        <div class="value">{data["bias"]}</div>
+                        <div class="value">{html.escape(data["bias"])}</div>
                     </div>
                     <div class="item">
                         <div class="label">Extended From EMA50</div>
@@ -1177,46 +1435,16 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
             <div class="card">
                 <h2>Smart Money Concepts</h2>
                 <div class="grid">
-                    <div class="item">
-                        <div class="label">Market Structure</div>
-                        <div class="value">{data["market_structure"]}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">PD Zone</div>
-                        <div class="value">{data["pd_zone"]}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Bullish BOS</div>
-                        <div class="value">{yes_no(data["bos_bullish"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Bearish BOS</div>
-                        <div class="value">{yes_no(data["bos_bearish"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Low Sweep</div>
-                        <div class="value">{yes_no(data["low_sweep"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">High Sweep</div>
-                        <div class="value">{yes_no(data["high_sweep"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Inside Bullish FVG</div>
-                        <div class="value">{yes_no(data["inside_bullish_fvg"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Inside Bearish FVG</div>
-                        <div class="value">{yes_no(data["inside_bearish_fvg"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Inside Bullish OB</div>
-                        <div class="value">{yes_no(data["inside_bullish_ob"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Inside Bearish OB</div>
-                        <div class="value">{yes_no(data["inside_bearish_ob"])}</div>
-                    </div>
+                    <div class="item"><div class="label">Market Structure</div><div class="value">{html.escape(data["market_structure"])}</div></div>
+                    <div class="item"><div class="label">PD Zone</div><div class="value">{html.escape(data["pd_zone"])}</div></div>
+                    <div class="item"><div class="label">Bullish BOS</div><div class="value">{yes_no(data["bos_bullish"])}</div></div>
+                    <div class="item"><div class="label">Bearish BOS</div><div class="value">{yes_no(data["bos_bearish"])}</div></div>
+                    <div class="item"><div class="label">Low Sweep</div><div class="value">{yes_no(data["low_sweep"])}</div></div>
+                    <div class="item"><div class="label">High Sweep</div><div class="value">{yes_no(data["high_sweep"])}</div></div>
+                    <div class="item"><div class="label">Inside Bullish FVG</div><div class="value">{yes_no(data["inside_bullish_fvg"])}</div></div>
+                    <div class="item"><div class="label">Inside Bearish FVG</div><div class="value">{yes_no(data["inside_bearish_fvg"])}</div></div>
+                    <div class="item"><div class="label">Inside Bullish OB</div><div class="value">{yes_no(data["inside_bullish_ob"])}</div></div>
+                    <div class="item"><div class="label">Inside Bearish OB</div><div class="value">{yes_no(data["inside_bearish_ob"])}</div></div>
                 </div>
 
                 <h3>SMC Notes</h3>
@@ -1226,79 +1454,34 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
             <div class="card">
                 <h2>Market Metrics</h2>
                 <div class="grid">
-                    <div class="item">
-                        <div class="label">EMA 50</div>
-                        <div class="value">{fmt(data["ema50"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">EMA 200</div>
-                        <div class="value">{fmt(data["ema200"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">RSI 14</div>
-                        <div class="value">{fmt(data["rsi14"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">ATR 14</div>
-                        <div class="value">{fmt(data["atr14"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Distance From EMA50</div>
-                        <div class="value">{fmt(data["distance_from_ema50_atr"])} ATR</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Distance From EMA50 %</div>
-                        <div class="value">{fmt(data["distance_from_ema50_pct"])}%</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Volume Strong</div>
-                        <div class="value">{yes_no(data["volume_strong"])}</div>
-                    </div>
+                    <div class="item"><div class="label">EMA 50</div><div class="value">{fmt(data["ema50"])}</div></div>
+                    <div class="item"><div class="label">EMA 200</div><div class="value">{fmt(data["ema200"])}</div></div>
+                    <div class="item"><div class="label">RSI 14</div><div class="value">{fmt(data["rsi14"])}</div></div>
+                    <div class="item"><div class="label">ATR 14</div><div class="value">{fmt(data["atr14"])}</div></div>
+                    <div class="item"><div class="label">Distance From EMA50</div><div class="value">{fmt(data["distance_from_ema50_atr"])} ATR</div></div>
+                    <div class="item"><div class="label">Distance From EMA50 %</div><div class="value">{fmt(data["distance_from_ema50_pct"])}%</div></div>
+                    <div class="item"><div class="label">Volume Strong</div><div class="value">{yes_no(data["volume_strong"])}</div></div>
                 </div>
             </div>
 
             <div class="card">
                 <h2>Trade Plan Estimate</h2>
                 <div class="grid">
-                    <div class="item">
-                        <div class="label">Entry Estimate</div>
-                        <div class="value">{fmt(data["entry"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Stop Loss</div>
-                        <div class="value">{fmt(data["stop_loss"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">TP1</div>
-                        <div class="value">{fmt(data["tp1"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">TP2</div>
-                        <div class="value">{fmt(data["tp2"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">TP3</div>
-                        <div class="value">{fmt(data["tp3"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Potential Move</div>
-                        <div class="value">{fmt(data["potential_pct"])}%</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Suggested Position</div>
-                        <div class="value">{data["suggested_position"]}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Suggested Leverage</div>
-                        <div class="value">{data["suggested_leverage"]}</div>
-                    </div>
+                    <div class="item"><div class="label">Entry Estimate</div><div class="value">{fmt(data["entry"])}</div></div>
+                    <div class="item"><div class="label">Stop Loss</div><div class="value">{fmt(data["stop_loss"])}</div></div>
+                    <div class="item"><div class="label">TP1</div><div class="value">{fmt(data["tp1"])}</div></div>
+                    <div class="item"><div class="label">TP2</div><div class="value">{fmt(data["tp2"])}</div></div>
+                    <div class="item"><div class="label">TP3</div><div class="value">{fmt(data["tp3"])}</div></div>
+                    <div class="item"><div class="label">Potential Move</div><div class="value">{fmt(data["potential_pct"])}%</div></div>
+                    <div class="item"><div class="label">Suggested Position</div><div class="value">{html.escape(data["suggested_position"])}</div></div>
+                    <div class="item"><div class="label">Suggested Leverage</div><div class="value">{html.escape(data["suggested_leverage"])}</div></div>
                 </div>
             </div>
 
             <div class="card">
-                <p>Updated UTC: {data["updated_at"]}</p>
-                <p>Raw JSON: <a href="/bybit/analyze/{data["symbol"]}?interval={data["interval"]}&ai=true">Open analysis JSON with AI</a></p>
-                <p>AI JSON: <a href="/bybit/ai/{data["symbol"]}?interval={data["interval"]}">Open AI analysis JSON</a></p>
+                <p>Updated UTC: {html.escape(data["updated_at"])}</p>
+                <p>Raw JSON: <a href="/bybit/analyze/{html.escape(data["symbol"])}?interval={html.escape(data["interval"])}&ai=true">Open analysis JSON with AI</a></p>
+                <p>AI JSON: <a href="/bybit/ai/{html.escape(data["symbol"])}?interval={html.escape(data["interval"])}">Open AI analysis JSON</a></p>
             </div>
         </div>
     </body>
@@ -1306,3 +1489,382 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
     """
 
     return html_page
+
+
+@app.get("/chart", response_class=HTMLResponse)
+def visual_chart(symbol: str = "BTCUSDT", interval: str = "60"):
+    symbol = symbol.upper()
+
+    data = analyze_market(symbol=symbol, interval=interval)
+
+    if data["status"] != "ok":
+        return f"""
+        <html>
+        <body>
+            <h1>Trading Agent Chart</h1>
+            <p>Error: {html.escape(str(data.get("message")))}</p>
+        </body>
+        </html>
+        """
+
+    ai_brief = generate_ai_market_brief(data)
+    log_ai_decision(data, ai_brief)
+
+    chart_payload = prepare_chart_payload(symbol=symbol, interval=interval, limit=220)
+
+    candles_json = json.dumps(chart_payload["candles"])
+    ema50_json = json.dumps(chart_payload["ema50"])
+    ema200_json = json.dumps(chart_payload["ema200"])
+
+    levels = {
+        "entry": data.get("entry"),
+        "stop_loss": data.get("stop_loss"),
+        "tp1": data.get("tp1"),
+        "tp2": data.get("tp2"),
+        "tp3": data.get("tp3"),
+        "ema50": data.get("ema50"),
+        "ema200": data.get("ema200"),
+    }
+
+    levels_json = json.dumps(levels)
+
+    ai_text = html.escape(ai_brief.get("brief", "")).replace("\n", "<br>")
+
+    if data["decision"] in ["SMART LONG", "LONG BIAS"]:
+        badge_color = "#16a34a"
+    elif data["decision"] in ["SMART SHORT", "SHORT BIAS"]:
+        badge_color = "#dc2626"
+    elif data["decision"] == "DO NOT CHASE":
+        badge_color = "#7c3aed"
+    else:
+        badge_color = "#64748b"
+
+    page = f"""
+    <html>
+    <head>
+        <title>Trading Agent Visual Chart</title>
+        <meta http-equiv="refresh" content="60">
+        <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+        <style>
+            body {{
+                margin: 0;
+                font-family: Arial, sans-serif;
+                background: #0f172a;
+                color: #e5e7eb;
+            }}
+            .layout {{
+                display: grid;
+                grid-template-columns: minmax(0, 2fr) 420px;
+                min-height: 100vh;
+            }}
+            .chart-side {{
+                padding: 18px;
+            }}
+            .panel-side {{
+                border-left: 1px solid #334155;
+                background: #111827;
+                padding: 18px;
+                overflow-y: auto;
+            }}
+            #chart {{
+                width: 100%;
+                height: calc(100vh - 130px);
+                min-height: 520px;
+                background: #0b1220;
+                border: 1px solid #334155;
+                border-radius: 16px;
+            }}
+            .topbar {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 14px;
+                gap: 12px;
+            }}
+            .title {{
+                font-size: 24px;
+                font-weight: bold;
+            }}
+            .badge {{
+                background: {badge_color};
+                padding: 10px 14px;
+                border-radius: 12px;
+                font-weight: bold;
+                color: white;
+            }}
+            .card {{
+                background: #0f172a;
+                border: 1px solid #334155;
+                border-radius: 14px;
+                padding: 14px;
+                margin-bottom: 14px;
+            }}
+            .label {{
+                color: #94a3b8;
+                font-size: 12px;
+            }}
+            .value {{
+                font-size: 18px;
+                font-weight: bold;
+                margin-top: 3px;
+            }}
+            .grid {{
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 10px;
+            }}
+            .ai {{
+                background: #020617;
+                border-left: 4px solid #38bdf8;
+                padding: 12px;
+                border-radius: 10px;
+                line-height: 1.55;
+                font-size: 14px;
+            }}
+            .small {{
+                color: #94a3b8;
+                font-size: 12px;
+            }}
+            a {{
+                color: #60a5fa;
+            }}
+            .legend {{
+                display: flex;
+                gap: 12px;
+                flex-wrap: wrap;
+                margin-top: 10px;
+                font-size: 13px;
+                color: #cbd5e1;
+            }}
+            .dot {{
+                display: inline-block;
+                width: 10px;
+                height: 10px;
+                border-radius: 99px;
+                margin-right: 5px;
+            }}
+            @media (max-width: 1000px) {{
+                .layout {{
+                    grid-template-columns: 1fr;
+                }}
+                .panel-side {{
+                    border-left: none;
+                    border-top: 1px solid #334155;
+                }}
+                #chart {{
+                    height: 560px;
+                }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="layout">
+            <div class="chart-side">
+                <div class="topbar">
+                    <div>
+                        <div class="title">{html.escape(symbol)} Visual Agent Chart</div>
+                        <div class="small">Timeframe: {html.escape(interval)} | Updated UTC: {html.escape(data["updated_at"])}</div>
+                    </div>
+                    <div class="badge">{html.escape(data["decision"])} / {html.escape(data["action"])}</div>
+                </div>
+
+                <div id="chart"></div>
+
+                <div class="legend">
+                    <span><span class="dot" style="background:#38bdf8;"></span>EMA50</span>
+                    <span><span class="dot" style="background:#f59e0b;"></span>EMA200</span>
+                    <span><span class="dot" style="background:#ffffff;"></span>Entry</span>
+                    <span><span class="dot" style="background:#ef4444;"></span>Stop Loss</span>
+                    <span><span class="dot" style="background:#22c55e;"></span>Take Profits</span>
+                </div>
+            </div>
+
+            <div class="panel-side">
+                <div class="card">
+                    <h2>Agent Decision</h2>
+                    <div class="grid">
+                        <div>
+                            <div class="label">Price</div>
+                            <div class="value">{fmt_number(data["price"])}</div>
+                        </div>
+                        <div>
+                            <div class="label">Trend</div>
+                            <div class="value">{html.escape(data["trend"])}</div>
+                        </div>
+                        <div>
+                            <div class="label">Bias</div>
+                            <div class="value">{html.escape(data["bias"])}</div>
+                        </div>
+                        <div>
+                            <div class="label">PD Zone</div>
+                            <div class="value">{html.escape(data["pd_zone"])}</div>
+                        </div>
+                    </div>
+                    <p>{html.escape(data["reason"])}</p>
+                </div>
+
+                <div class="card">
+                    <h2>Scores</h2>
+                    <div class="grid">
+                        <div>
+                            <div class="label">SMC</div>
+                            <div class="value">{data["smc_score"]}/50</div>
+                        </div>
+                        <div>
+                            <div class="label">Technical</div>
+                            <div class="value">{data["technical_score"]}/35</div>
+                        </div>
+                        <div>
+                            <div class="label">Risk</div>
+                            <div class="value">{data["risk_score"]}/15</div>
+                        </div>
+                        <div>
+                            <div class="label">Total</div>
+                            <div class="value">{data["total_score"]}/100</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Trade Plan Levels</h2>
+                    <div class="grid">
+                        <div>
+                            <div class="label">Entry</div>
+                            <div class="value">{fmt_number(data["entry"])}</div>
+                        </div>
+                        <div>
+                            <div class="label">Stop Loss</div>
+                            <div class="value">{fmt_number(data["stop_loss"])}</div>
+                        </div>
+                        <div>
+                            <div class="label">TP1</div>
+                            <div class="value">{fmt_number(data["tp1"])}</div>
+                        </div>
+                        <div>
+                            <div class="label">TP2</div>
+                            <div class="value">{fmt_number(data["tp2"])}</div>
+                        </div>
+                        <div>
+                            <div class="label">TP3</div>
+                            <div class="value">{fmt_number(data["tp3"])}</div>
+                        </div>
+                        <div>
+                            <div class="label">Potential</div>
+                            <div class="value">{fmt_number(data["potential_pct"])}%</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>SMC Checklist</h2>
+                    <div class="grid">
+                        <div><div class="label">Structure</div><div class="value">{html.escape(data["market_structure"])}</div></div>
+                        <div><div class="label">Low Sweep</div><div class="value">{"YES" if data["low_sweep"] else "NO"}</div></div>
+                        <div><div class="label">High Sweep</div><div class="value">{"YES" if data["high_sweep"] else "NO"}</div></div>
+                        <div><div class="label">Bull FVG</div><div class="value">{"YES" if data["inside_bullish_fvg"] else "NO"}</div></div>
+                        <div><div class="label">Bear FVG</div><div class="value">{"YES" if data["inside_bearish_fvg"] else "NO"}</div></div>
+                        <div><div class="label">Bull OB</div><div class="value">{"YES" if data["inside_bullish_ob"] else "NO"}</div></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>AI Market Brief</h2>
+                    <div class="ai">{ai_text}</div>
+                    <p class="small">AI status: {html.escape(str(ai_brief.get("status")))} | Model: {html.escape(str(ai_brief.get("model")))} | Updated: {html.escape(str(ai_brief.get("updated_at")))}</p>
+                </div>
+
+                <div class="card">
+                    <a href="/dashboard?symbol={html.escape(symbol)}&interval={html.escape(interval)}">Open Dashboard</a><br>
+                    <a href="/decision-log">Open Decision Log</a><br>
+                    <a href="/bybit/chart-data/{html.escape(symbol)}?interval={html.escape(interval)}">Open Chart JSON</a>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            const candleData = {candles_json};
+            const ema50Data = {ema50_json};
+            const ema200Data = {ema200_json};
+            const levels = {levels_json};
+
+            const chartContainer = document.getElementById('chart');
+
+            const chart = LightweightCharts.createChart(chartContainer, {{
+                layout: {{
+                    background: {{ color: '#0b1220' }},
+                    textColor: '#d1d5db',
+                }},
+                grid: {{
+                    vertLines: {{ color: '#1f2937' }},
+                    horzLines: {{ color: '#1f2937' }},
+                }},
+                crosshair: {{
+                    mode: LightweightCharts.CrosshairMode.Normal,
+                }},
+                rightPriceScale: {{
+                    borderColor: '#374151',
+                }},
+                timeScale: {{
+                    borderColor: '#374151',
+                    timeVisible: true,
+                    secondsVisible: false,
+                }},
+            }});
+
+            const candleSeries = chart.addCandlestickSeries({{
+                upColor: '#22c55e',
+                downColor: '#ef4444',
+                borderUpColor: '#22c55e',
+                borderDownColor: '#ef4444',
+                wickUpColor: '#22c55e',
+                wickDownColor: '#ef4444',
+            }});
+
+            candleSeries.setData(candleData);
+
+            const ema50Series = chart.addLineSeries({{
+                color: '#38bdf8',
+                lineWidth: 2,
+                title: 'EMA50',
+            }});
+            ema50Series.setData(ema50Data);
+
+            const ema200Series = chart.addLineSeries({{
+                color: '#f59e0b',
+                lineWidth: 2,
+                title: 'EMA200',
+            }});
+            ema200Series.setData(ema200Data);
+
+            function addPriceLine(series, price, title, color, style = LightweightCharts.LineStyle.Solid) {{
+                if (price === null || price === undefined) return;
+                series.createPriceLine({{
+                    price: price,
+                    color: color,
+                    lineWidth: 2,
+                    lineStyle: style,
+                    axisLabelVisible: true,
+                    title: title,
+                }});
+            }}
+
+            addPriceLine(candleSeries, levels.entry, 'Entry', '#ffffff');
+            addPriceLine(candleSeries, levels.stop_loss, 'SL', '#ef4444');
+            addPriceLine(candleSeries, levels.tp1, 'TP1', '#22c55e');
+            addPriceLine(candleSeries, levels.tp2, 'TP2', '#16a34a', LightweightCharts.LineStyle.Dashed);
+            addPriceLine(candleSeries, levels.tp3, 'TP3', '#15803d', LightweightCharts.LineStyle.Dashed);
+
+            chart.timeScale().fitContent();
+
+            window.addEventListener('resize', () => {{
+                chart.applyOptions({{
+                    width: chartContainer.clientWidth,
+                    height: chartContainer.clientHeight,
+                }});
+            }});
+        </script>
+    </body>
+    </html>
+    """
+
+    return page
