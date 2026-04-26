@@ -512,6 +512,9 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         potential_pct = 0
 
     # Decision logic
+    min_smc_for_smart_signal = 30
+    min_total_for_smart_signal = 75
+
     if trend == "NEUTRAL / CHOP":
         decision = "NO TRADE"
         action = "WAIT"
@@ -519,7 +522,7 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         position = "$0"
         leverage = "None"
 
-    elif extended and smc["smc_score"] < 30:
+    elif extended and smc["smc_score"] < min_smc_for_smart_signal:
         decision = "DO NOT CHASE"
         action = "WAIT FOR PULLBACK"
         reason = "Trend exists, but price is extended from EMA50 and SMC confirmation is not strong enough."
@@ -527,20 +530,20 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         if bias == "LONG":
             if pd["pd_zone"] == "PREMIUM":
                 reason += " Price is in premium zone; buying here is expensive."
-            reason += " Wait for pullback into discount, bullish OB/FVG, or liquidity sweep."
+            reason += " Wait for pullback into discount, bullish OB/FVG, liquidity sweep, or bullish rejection."
 
         elif bias == "SHORT":
             if pd["pd_zone"] == "DISCOUNT":
                 reason += " Price is in discount zone; shorting here is late."
-            reason += " Wait for pullback into premium, bearish OB/FVG, or liquidity sweep."
+            reason += " Wait for pullback into premium, bearish OB/FVG, liquidity sweep, or bearish rejection."
 
         position = "$0"
         leverage = "None"
 
-    elif bias == "LONG" and total_score >= 75:
+    elif bias == "LONG" and total_score >= min_total_for_smart_signal and smc["smc_score"] >= min_smc_for_smart_signal:
         decision = "SMART LONG"
         action = "PREPARE LONG"
-        reason = "Bullish trend with acceptable technical and SMC confirmation."
+        reason = "Bullish trend with acceptable technical, risk, and SMC confirmation."
 
         if smc["smc_notes"]:
             reason += " " + "; ".join(smc["smc_notes"]) + "."
@@ -548,28 +551,54 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         position = "Small test position only"
         leverage = "Low / conservative"
 
-    elif bias == "SHORT" and total_score >= 75:
+    elif bias == "SHORT" and total_score >= min_total_for_smart_signal and smc["smc_score"] >= min_smc_for_smart_signal:
         decision = "SMART SHORT"
         action = "PREPARE SHORT"
-        reason = "Bearish trend with acceptable technical and SMC confirmation."
+        reason = "Bearish trend with acceptable technical, risk, and SMC confirmation."
 
         if smc["smc_notes"]:
             reason += " " + "; ".join(smc["smc_notes"]) + "."
 
         position = "Small test position only"
         leverage = "Low / conservative"
+
+    elif bias == "LONG" and total_score >= min_total_for_smart_signal and smc["smc_score"] < min_smc_for_smart_signal:
+        decision = "LONG BIAS"
+        action = "WAIT FOR SMC TRIGGER"
+        reason = (
+            "Bullish trend and risk conditions are good, but SMC confirmation is still not strong enough. "
+            "Do not chase. Wait for low sweep, bullish BOS, reaction from bullish FVG/OB, or pullback into discount."
+        )
+        position = "Not yet"
+        leverage = "Not yet"
+
+    elif bias == "SHORT" and total_score >= min_total_for_smart_signal and smc["smc_score"] < min_smc_for_smart_signal:
+        decision = "SHORT BIAS"
+        action = "WAIT FOR SMC TRIGGER"
+        reason = (
+            "Bearish trend and risk conditions are good, but SMC confirmation is still not strong enough. "
+            "Do not chase. Wait for high sweep, bearish BOS, reaction from bearish FVG/OB, or pullback into premium."
+        )
+        position = "Not yet"
+        leverage = "Not yet"
 
     elif bias == "LONG":
         decision = "LONG BIAS"
         action = "WAIT FOR LONG TRIGGER"
-        reason = "Bullish trend detected, but full confirmation is not strong enough yet. Wait for pullback, sweep, bullish OB/FVG reaction, or better risk location."
+        reason = (
+            "Bullish trend detected, but full confirmation is not strong enough yet. "
+            "Wait for pullback, low sweep, bullish OB/FVG reaction, or better risk location."
+        )
         position = "Not yet"
         leverage = "Not yet"
 
     elif bias == "SHORT":
         decision = "SHORT BIAS"
         action = "WAIT FOR SHORT TRIGGER"
-        reason = "Bearish trend detected, but full confirmation is not strong enough yet. Wait for pullback, sweep, bearish OB/FVG reaction, or better risk location."
+        reason = (
+            "Bearish trend detected, but full confirmation is not strong enough yet. "
+            "Wait for pullback, high sweep, bearish OB/FVG reaction, or better risk location."
+        )
         position = "Not yet"
         leverage = "Not yet"
 
