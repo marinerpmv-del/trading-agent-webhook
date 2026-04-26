@@ -9,7 +9,7 @@ import html
 import time
 
 app = FastAPI()
-
+ai_brief_cache = {}
 signals_log = []
 
 # Public Bybit connection. No API key needed for market data.
