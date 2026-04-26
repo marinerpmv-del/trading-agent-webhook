@@ -7,6 +7,7 @@ import os
 import json
 import html
 import time
+from typing import Optional
 
 app = FastAPI()
 
@@ -32,6 +33,40 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # Cache AI brief to avoid spending money every dashboard refresh.
 AI_CACHE_TTL_SECONDS = int(os.getenv("AI_CACHE_TTL_SECONDS", "600"))
+
+# UI defaults for dashboard/chart selectors.
+DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "APTUSDT"]
+INTERVAL_OPTIONS = [
+    ("1", "1m"),
+    ("5", "5m"),
+    ("15", "15m"),
+    ("30", "30m"),
+    ("60", "1H"),
+    ("120", "2H"),
+    ("240", "4H"),
+    ("D", "1D"),
+    ("W", "1W"),
+]
+
+
+def interval_label(interval):
+    for value, label in INTERVAL_OPTIONS:
+        if str(interval) == value:
+            return label
+    return str(interval)
+
+
+def interval_select_html(selected_interval):
+    selected_interval = str(selected_interval)
+    options = []
+    for value, label in INTERVAL_OPTIONS:
+        selected = " selected" if value == selected_interval else ""
+        options.append(f'<option value="{html.escape(value)}"{selected}>{html.escape(label)}</option>')
+    return "".join(options)
+
+
+def symbol_datalist_html():
+    return "".join(f'<option value="{html.escape(sym)}">' for sym in DEFAULT_SYMBOLS)
 
 
 # =====================================================
@@ -1059,14 +1094,26 @@ def get_signals():
 
 
 @app.get("/decision-log")
-def get_decision_log(limit: int = 50):
+def get_decision_log(limit: int = 50, symbol: Optional[str] = None, interval: Optional[str] = None):
     limit = max(1, min(limit, 100))
+
+    items = ai_decision_log
+
+    if symbol:
+        symbol = symbol.upper()
+        items = [item for item in items if item.get("symbol") == symbol]
+
+    if interval:
+        interval = str(interval)
+        items = [item for item in items if str(item.get("interval")) == interval]
 
     return {
         "status": "ok",
-        "count": len(ai_decision_log),
+        "count": len(items),
         "limit": limit,
-        "items": ai_decision_log[-limit:],
+        "symbol": symbol,
+        "interval": interval,
+        "items": items[-limit:],
     }
 
 
@@ -1153,7 +1200,9 @@ def get_chart_data(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 1
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
-    data = analyze_market(symbol=symbol.upper(), interval=interval)
+    symbol = symbol.upper()
+    interval = str(interval)
+    data = analyze_market(symbol=symbol, interval=interval)
 
     if data["status"] != "ok":
         return f"""
@@ -1210,8 +1259,16 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
     ai_updated = ai_brief.get("updated_at")
     ai_text = text_to_html(ai_brief.get("brief", ""))
 
+    interval_options_html = interval_select_html(data["interval"])
+    symbol_datalist = symbol_datalist_html()
+    interval_display = interval_label(data["interval"])
+
     decision_log_rows = ""
-    recent_log_items = list(reversed(ai_decision_log[-10:]))
+    filtered_log_items = [
+        item for item in ai_decision_log
+        if item.get("symbol") == data["symbol"] and str(item.get("interval")) == str(data["interval"])
+    ]
+    recent_log_items = list(reversed(filtered_log_items[-10:]))
 
     if recent_log_items:
         for item in recent_log_items:
@@ -1334,6 +1391,36 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                 color: #93c5fd;
                 font-weight: bold;
             }}
+            .controls {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+                align-items: end;
+                margin-bottom: 18px;
+                background: #111827;
+                border: 1px solid #374151;
+                border-radius: 14px;
+                padding: 14px;
+            }}
+            .control-group {{
+                display: flex;
+                flex-direction: column;
+                gap: 5px;
+            }}
+            input, select, button {{
+                background: #020617;
+                color: #e5e7eb;
+                border: 1px solid #475569;
+                border-radius: 10px;
+                padding: 9px 11px;
+                font-size: 15px;
+            }}
+            button {{
+                background: #2563eb;
+                border-color: #2563eb;
+                cursor: pointer;
+                font-weight: bold;
+            }}
             .top-links {{
                 margin-bottom: 18px;
             }}
@@ -1346,9 +1433,23 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
         <div class="container">
             <h1>Trading Agent Dashboard</h1>
 
+            <form class="controls" method="get" action="/dashboard">
+                <div class="control-group">
+                    <label class="label" for="symbol">Symbol</label>
+                    <input id="symbol" name="symbol" list="symbols" value="{html.escape(data["symbol"])}" autocomplete="off">
+                    <datalist id="symbols">{symbol_datalist}</datalist>
+                </div>
+                <div class="control-group">
+                    <label class="label" for="interval">Timeframe</label>
+                    <select id="interval" name="interval">{interval_options_html}</select>
+                </div>
+                <button type="submit">Analyze</button>
+                <a href="/chart?symbol={html.escape(data["symbol"])}&interval={html.escape(data["interval"])}">Open Visual Chart</a>
+            </form>
+
             <div class="top-links">
                 <a href="/chart?symbol={html.escape(data["symbol"])}&interval={html.escape(data["interval"])}">Open Visual Chart</a>
-                <a href="/decision-log">Open Decision Log JSON</a>
+                <a href="/decision-log?symbol={html.escape(data["symbol"])}&interval={html.escape(data["interval"])}">Open Decision Log JSON</a>
                 <a href="/bybit/analyze/{html.escape(data["symbol"])}?interval={html.escape(data["interval"])}&ai=true">Open Analysis JSON</a>
             </div>
 
@@ -1366,7 +1467,7 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
 
             <div class="card">
                 <h2>AI Decision Log</h2>
-                <p class="small">Last 10 logged AI decisions. Full JSON: <a href="/decision-log">Open decision log</a></p>
+                <p class="small">Last 10 logged AI decisions for this symbol/timeframe. Full JSON: <a href="/decision-log?symbol={html.escape(data["symbol"])}&interval={html.escape(data["interval"])}">Open decision log</a></p>
                 <table>
                     <thead>
                         <tr>
@@ -1411,7 +1512,7 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
             </div>
 
             <div class="card">
-                <h2>{html.escape(data["symbol"])} / Timeframe: {html.escape(data["interval"])}</h2>
+                <h2>{html.escape(data["symbol"])} / Timeframe: {html.escape(interval_display)}</h2>
                 <div class="grid">
                     <div class="item">
                         <div class="label">Current Price</div>
@@ -1511,6 +1612,10 @@ def visual_chart(symbol: str = "BTCUSDT", interval: str = "60"):
     log_ai_decision(data, ai_brief)
 
     chart_payload = prepare_chart_payload(symbol=symbol, interval=interval, limit=220)
+
+    interval_options_html = interval_select_html(interval)
+    symbol_datalist = symbol_datalist_html()
+    interval_display = interval_label(interval)
 
     candles_json = json.dumps(chart_payload["candles"])
     ema50_json = json.dumps(chart_payload["ema50"])
@@ -1636,6 +1741,36 @@ def visual_chart(symbol: str = "BTCUSDT", interval: str = "60"):
                 font-size: 13px;
                 color: #cbd5e1;
             }}
+            .controls {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+                align-items: end;
+                margin: 10px 0 14px 0;
+                background: #111827;
+                border: 1px solid #334155;
+                border-radius: 14px;
+                padding: 12px;
+            }}
+            .control-group {{
+                display: flex;
+                flex-direction: column;
+                gap: 5px;
+            }}
+            input, select, button {{
+                background: #020617;
+                color: #e5e7eb;
+                border: 1px solid #475569;
+                border-radius: 10px;
+                padding: 8px 10px;
+                font-size: 14px;
+            }}
+            button {{
+                background: #2563eb;
+                border-color: #2563eb;
+                cursor: pointer;
+                font-weight: bold;
+            }}
             .dot {{
                 display: inline-block;
                 width: 10px;
@@ -1663,10 +1798,24 @@ def visual_chart(symbol: str = "BTCUSDT", interval: str = "60"):
                 <div class="topbar">
                     <div>
                         <div class="title">{html.escape(symbol)} Visual Agent Chart</div>
-                        <div class="small">Timeframe: {html.escape(interval)} | Updated UTC: {html.escape(data["updated_at"])}</div>
+                        <div class="small">Timeframe: {html.escape(interval_display)} | Updated UTC: {html.escape(data["updated_at"])}</div>
                     </div>
                     <div class="badge">{html.escape(data["decision"])} / {html.escape(data["action"])}</div>
                 </div>
+
+                <form class="controls" method="get" action="/chart">
+                    <div class="control-group">
+                        <label class="label" for="symbol">Symbol</label>
+                        <input id="symbol" name="symbol" list="symbols" value="{html.escape(symbol)}" autocomplete="off">
+                        <datalist id="symbols">{symbol_datalist}</datalist>
+                    </div>
+                    <div class="control-group">
+                        <label class="label" for="interval">Timeframe</label>
+                        <select id="interval" name="interval">{interval_options_html}</select>
+                    </div>
+                    <button type="submit">Update Chart</button>
+                    <a href="/dashboard?symbol={html.escape(symbol)}&interval={html.escape(interval)}">Open Dashboard</a>
+                </form>
 
                 <div id="chart"></div>
 
@@ -1775,7 +1924,7 @@ def visual_chart(symbol: str = "BTCUSDT", interval: str = "60"):
 
                 <div class="card">
                     <a href="/dashboard?symbol={html.escape(symbol)}&interval={html.escape(interval)}">Open Dashboard</a><br>
-                    <a href="/decision-log">Open Decision Log</a><br>
+                    <a href="/decision-log?symbol={html.escape(symbol)}&interval={html.escape(interval)}">Open Decision Log</a><br>
                     <a href="/bybit/chart-data/{html.escape(symbol)}?interval={html.escape(interval)}">Open Chart JSON</a>
                 </div>
             </div>
