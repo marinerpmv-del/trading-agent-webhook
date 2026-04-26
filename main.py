@@ -2,6 +2,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
+from openai import OpenAI
+import os
+import json
+import html
+import time
 
 app = FastAPI()
 
@@ -9,6 +14,17 @@ signals_log = []
 
 # Public Bybit connection. No API key needed for market data.
 bybit = HTTP(testnet=False)
+
+# OpenAI client.
+# The key must be stored in Render Environment Variables as OPENAI_API_KEY.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Cache AI brief to avoid spending money every dashboard refresh.
+AI_CACHE_TTL_SECONDS = int(os.getenv("AI_CACHE_TTL_SECONDS", "600"))
+ai_brief_cache = {}
 
 
 # =====================================================
@@ -393,6 +409,174 @@ def calculate_smc_score(bias, liquidity, structure, fvg, ob, pd):
 
 
 # =====================================================
+# AI MARKET BRIEF
+# =====================================================
+
+def compact_market_data_for_ai(data):
+    return {
+        "symbol": data.get("symbol"),
+        "timeframe": data.get("interval"),
+        "price": round(data.get("price", 0), 2),
+        "decision": data.get("decision"),
+        "action": data.get("action"),
+        "reason": data.get("reason"),
+        "trend": data.get("trend"),
+        "bias": data.get("bias"),
+        "extended_from_ema50": data.get("extended"),
+        "ema50": round(data.get("ema50", 0), 2),
+        "ema200": round(data.get("ema200", 0), 2),
+        "rsi14": round(data.get("rsi14", 0), 2),
+        "atr14": round(data.get("atr14", 0), 2),
+        "distance_from_ema50_atr": round(data.get("distance_from_ema50_atr", 0), 2),
+        "distance_from_ema50_pct": round(data.get("distance_from_ema50_pct", 0), 2),
+        "volume_strong": data.get("volume_strong"),
+        "market_structure": data.get("market_structure"),
+        "pd_zone": data.get("pd_zone"),
+        "bos_bullish": data.get("bos_bullish"),
+        "bos_bearish": data.get("bos_bearish"),
+        "low_sweep": data.get("low_sweep"),
+        "high_sweep": data.get("high_sweep"),
+        "inside_bullish_fvg": data.get("inside_bullish_fvg"),
+        "inside_bearish_fvg": data.get("inside_bearish_fvg"),
+        "inside_bullish_ob": data.get("inside_bullish_ob"),
+        "inside_bearish_ob": data.get("inside_bearish_ob"),
+        "smc_score": data.get("smc_score"),
+        "technical_score": data.get("technical_score"),
+        "risk_score": data.get("risk_score"),
+        "total_score": data.get("total_score"),
+        "entry": data.get("entry"),
+        "stop_loss": data.get("stop_loss"),
+        "tp1": data.get("tp1"),
+        "tp2": data.get("tp2"),
+        "tp3": data.get("tp3"),
+        "suggested_position": data.get("suggested_position"),
+        "suggested_leverage": data.get("suggested_leverage"),
+    }
+
+
+def generate_ai_market_brief(data):
+    cache_key = f"{data.get('symbol')}:{data.get('interval')}:{data.get('decision')}:{data.get('total_score')}:{data.get('smc_score')}"
+    now = time.time()
+
+    cached = ai_brief_cache.get(cache_key)
+    if cached and now - cached["created_at"] < AI_CACHE_TTL_SECONDS:
+        return {
+            "status": "cached",
+            "brief": cached["brief"],
+            "updated_at": cached["updated_at"],
+            "model": cached["model"],
+        }
+
+    if not openai_client:
+        return {
+            "status": "disabled",
+            "brief": (
+                "AI Market Brief is not available because OPENAI_API_KEY is not configured. "
+                "Check Render Environment Variables."
+            ),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "model": None,
+        }
+
+    market_data = compact_market_data_for_ai(data)
+
+    system_prompt = """
+You are a cautious crypto trading analysis assistant.
+
+You do NOT give financial advice.
+You do NOT guarantee profits.
+You do NOT encourage high leverage.
+You analyze only the provided structured market data.
+
+Your job:
+1. Explain the current market situation clearly.
+2. Identify whether the setup is actionable or should be watched.
+3. Explain what confirmation is missing.
+4. Describe what to wait for.
+5. Define invalidation.
+6. Give a risk warning.
+
+Use concise trader language.
+Be skeptical.
+Do not overhype the setup.
+If SMC confirmation is weak, say it clearly.
+If the agent says WAIT, do not turn it into an entry signal.
+
+Return the answer in this exact format:
+
+Market Scenario:
+...
+
+Entry Quality:
+...
+
+What To Wait For:
+...
+
+Invalidation:
+...
+
+Risk Warning:
+...
+"""
+
+    user_prompt = f"""
+Analyze this trading-agent output.
+
+Market data JSON:
+{json.dumps(market_data, indent=2)}
+
+Important rules:
+- If decision is LONG BIAS or SHORT BIAS, treat it as watch-only, not an entry.
+- If SMC score is below 30/50, say SMC confirmation is not strong enough for a smart signal.
+- If decision is SMART LONG or SMART SHORT, still mention that the trade requires risk control and confirmation.
+- Keep it practical and concise.
+"""
+
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+            max_output_tokens=700,
+        )
+
+        brief = response.output_text.strip()
+
+        result = {
+            "status": "ok",
+            "brief": brief,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "model": OPENAI_MODEL,
+        }
+
+        ai_brief_cache[cache_key] = {
+            "brief": brief,
+            "created_at": now,
+            "updated_at": result["updated_at"],
+            "model": OPENAI_MODEL,
+        }
+
+        return result
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "brief": f"AI Market Brief error: {str(e)}",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "model": OPENAI_MODEL,
+        }
+
+
+# =====================================================
 # MAIN ANALYSIS ENGINE
 # =====================================================
 
@@ -691,6 +875,8 @@ def home():
         "message": "Trading agent webhook is running",
         "signals_received": len(signals_log),
         "bybit_public_data": "enabled",
+        "openai_key_configured": OPENAI_API_KEY is not None,
+        "ai_model": OPENAI_MODEL,
         "dashboard": "/dashboard",
     }
 
@@ -756,9 +942,31 @@ def get_bybit_kline(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 
 
 
 @app.get("/bybit/analyze/{symbol}")
-def get_analysis(symbol: str = "BTCUSDT", interval: str = "60"):
+def get_analysis(symbol: str = "BTCUSDT", interval: str = "60", ai: bool = False):
     symbol = symbol.upper()
-    return analyze_market(symbol=symbol, interval=interval)
+    data = analyze_market(symbol=symbol, interval=interval)
+
+    if ai and data.get("status") == "ok":
+        data["ai_market_brief"] = generate_ai_market_brief(data)
+
+    return data
+
+
+@app.get("/bybit/ai/{symbol}")
+def get_ai_analysis(symbol: str = "BTCUSDT", interval: str = "60"):
+    symbol = symbol.upper()
+    data = analyze_market(symbol=symbol, interval=interval)
+
+    if data.get("status") != "ok":
+        return data
+
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "interval": interval,
+        "analysis": data,
+        "ai_market_brief": generate_ai_market_brief(data),
+    }
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -774,6 +982,8 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
         </body>
         </html>
         """
+
+    ai_brief = generate_ai_market_brief(data)
 
     decision = data["decision"]
 
@@ -800,17 +1010,26 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
     def yes_no(value):
         return "YES" if value else "NO"
 
+    def text_to_html(value):
+        safe = html.escape(value or "")
+        return safe.replace("\n", "<br>")
+
     smc_notes_html = ""
 
     if data["smc_notes"]:
         smc_notes_html = "<ul>"
         for note in data["smc_notes"]:
-            smc_notes_html += f"<li>{note}</li>"
+            smc_notes_html += f"<li>{html.escape(note)}</li>"
         smc_notes_html += "</ul>"
     else:
         smc_notes_html = "<p>No strong SMC confirmation yet.</p>"
 
-    html = f"""
+    ai_status = ai_brief.get("status")
+    ai_model = ai_brief.get("model") or "not configured"
+    ai_updated = ai_brief.get("updated_at")
+    ai_text = text_to_html(ai_brief.get("brief", ""))
+
+    html_page = f"""
     <html>
     <head>
         <title>Trading Agent Dashboard</title>
@@ -875,6 +1094,18 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                 font-size: 24px;
                 font-weight: bold;
             }}
+            .ai {{
+                background: #0b1220;
+                border-left: 4px solid #38bdf8;
+                padding: 16px;
+                border-radius: 12px;
+                line-height: 1.65;
+                font-size: 16px;
+            }}
+            .small {{
+                color: #9ca3af;
+                font-size: 13px;
+            }}
             a {{
                 color: #60a5fa;
             }}
@@ -890,7 +1121,13 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
             <div class="card">
                 <div class="decision">{data["decision"]}</div>
                 <h2>Action: {data["action"]}</h2>
-                <p class="reason">{data["reason"]}</p>
+                <p class="reason">{html.escape(data["reason"])}</p>
+            </div>
+
+            <div class="card">
+                <h2>AI Market Brief</h2>
+                <div class="ai">{ai_text}</div>
+                <p class="small">AI status: {html.escape(str(ai_status))} | Model: {html.escape(str(ai_model))} | Updated UTC: {html.escape(str(ai_updated))}</p>
             </div>
 
             <div class="card">
@@ -1060,11 +1297,12 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
 
             <div class="card">
                 <p>Updated UTC: {data["updated_at"]}</p>
-                <p>Raw JSON: <a href="/bybit/analyze/{data["symbol"]}?interval={data["interval"]}">Open analysis JSON</a></p>
+                <p>Raw JSON: <a href="/bybit/analyze/{data["symbol"]}?interval={data["interval"]}&ai=true">Open analysis JSON with AI</a></p>
+                <p>AI JSON: <a href="/bybit/ai/{data["symbol"]}?interval={data["interval"]}">Open AI analysis JSON</a></p>
             </div>
         </div>
     </body>
     </html>
     """
 
-    return html
+    return html_page
