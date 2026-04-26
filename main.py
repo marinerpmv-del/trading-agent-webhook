@@ -103,18 +103,314 @@ def get_bybit_candles(symbol="BTCUSDT", interval="60", limit=200):
     return candles
 
 
+# =====================================================
+# SMART MONEY CONCEPT HELPERS
+# =====================================================
+
+def find_swing_highs_lows(candles, left=3, right=3):
+    swing_highs = []
+    swing_lows = []
+
+    for i in range(left, len(candles) - right):
+        current_high = candles[i]["high"]
+        current_low = candles[i]["low"]
+
+        is_high = True
+        is_low = True
+
+        for j in range(i - left, i + right + 1):
+            if j == i:
+                continue
+
+            if candles[j]["high"] >= current_high:
+                is_high = False
+
+            if candles[j]["low"] <= current_low:
+                is_low = False
+
+        if is_high:
+            swing_highs.append({
+                "index": i,
+                "price": current_high,
+                "time": candles[i]["start_time"],
+            })
+
+        if is_low:
+            swing_lows.append({
+                "index": i,
+                "price": current_low,
+                "time": candles[i]["start_time"],
+            })
+
+    return swing_highs, swing_lows
+
+
+def detect_liquidity_sweep(candles, swing_highs, swing_lows):
+    last = candles[-1]
+    close = last["close"]
+    high = last["high"]
+    low = last["low"]
+
+    recent_high = swing_highs[-1]["price"] if swing_highs else None
+    recent_low = swing_lows[-1]["price"] if swing_lows else None
+
+    high_sweep = False
+    low_sweep = False
+
+    if recent_high is not None:
+        high_sweep = high > recent_high and close < recent_high
+
+    if recent_low is not None:
+        low_sweep = low < recent_low and close > recent_low
+
+    return {
+        "recent_high": recent_high,
+        "recent_low": recent_low,
+        "high_sweep": high_sweep,
+        "low_sweep": low_sweep,
+    }
+
+
+def detect_market_structure(candles, swing_highs, swing_lows):
+    close = candles[-1]["close"]
+
+    last_high = swing_highs[-1]["price"] if swing_highs else None
+    last_low = swing_lows[-1]["price"] if swing_lows else None
+
+    prev_high = swing_highs[-2]["price"] if len(swing_highs) >= 2 else None
+    prev_low = swing_lows[-2]["price"] if len(swing_lows) >= 2 else None
+
+    bos_bullish = last_high is not None and close > last_high
+    bos_bearish = last_low is not None and close < last_low
+
+    structure = "NEUTRAL"
+
+    if last_high is not None and prev_high is not None and last_low is not None and prev_low is not None:
+        if last_high > prev_high and last_low > prev_low:
+            structure = "BULLISH"
+        elif last_high < prev_high and last_low < prev_low:
+            structure = "BEARISH"
+        else:
+            structure = "MIXED / TRANSITION"
+
+    return {
+        "structure": structure,
+        "last_swing_high": last_high,
+        "last_swing_low": last_low,
+        "bos_bullish": bos_bullish,
+        "bos_bearish": bos_bearish,
+    }
+
+
+def detect_fvg(candles):
+    bullish_fvgs = []
+    bearish_fvgs = []
+
+    for i in range(2, len(candles)):
+        c1 = candles[i - 2]
+        c3 = candles[i]
+
+        # Bullish imbalance: current low is above candle-2 high.
+        if c3["low"] > c1["high"]:
+            bullish_fvgs.append({
+                "index": i,
+                "low": c1["high"],
+                "high": c3["low"],
+                "mid": (c1["high"] + c3["low"]) / 2,
+            })
+
+        # Bearish imbalance: current high is below candle-2 low.
+        if c3["high"] < c1["low"]:
+            bearish_fvgs.append({
+                "index": i,
+                "low": c3["high"],
+                "high": c1["low"],
+                "mid": (c3["high"] + c1["low"]) / 2,
+            })
+
+    price = candles[-1]["close"]
+
+    last_bullish_fvg = bullish_fvgs[-1] if bullish_fvgs else None
+    last_bearish_fvg = bearish_fvgs[-1] if bearish_fvgs else None
+
+    inside_bullish_fvg = False
+    inside_bearish_fvg = False
+
+    if last_bullish_fvg:
+        inside_bullish_fvg = last_bullish_fvg["low"] <= price <= last_bullish_fvg["high"]
+
+    if last_bearish_fvg:
+        inside_bearish_fvg = last_bearish_fvg["low"] <= price <= last_bearish_fvg["high"]
+
+    return {
+        "bullish_fvg_active": last_bullish_fvg is not None,
+        "bearish_fvg_active": last_bearish_fvg is not None,
+        "inside_bullish_fvg": inside_bullish_fvg,
+        "inside_bearish_fvg": inside_bearish_fvg,
+        "last_bullish_fvg": last_bullish_fvg,
+        "last_bearish_fvg": last_bearish_fvg,
+    }
+
+
+def detect_order_blocks(candles, lookback=40):
+    price = candles[-1]["close"]
+
+    bullish_ob = None
+    bearish_ob = None
+
+    recent = candles[-lookback:]
+
+    for i in range(2, len(recent)):
+        prev = recent[i - 1]
+        curr = recent[i]
+
+        # Bullish OB approximation:
+        # last bearish candle before strong bullish displacement.
+        if prev["close"] < prev["open"] and curr["close"] > curr["open"]:
+            body = abs(curr["close"] - curr["open"])
+            candle_range = curr["high"] - curr["low"]
+
+            if candle_range > 0 and body / candle_range > 0.55 and curr["close"] > prev["high"]:
+                bullish_ob = {
+                    "low": prev["low"],
+                    "high": prev["high"],
+                    "mid": (prev["low"] + prev["high"]) / 2,
+                }
+
+        # Bearish OB approximation:
+        # last bullish candle before strong bearish displacement.
+        if prev["close"] > prev["open"] and curr["close"] < curr["open"]:
+            body = abs(curr["close"] - curr["open"])
+            candle_range = curr["high"] - curr["low"]
+
+            if candle_range > 0 and body / candle_range > 0.55 and curr["close"] < prev["low"]:
+                bearish_ob = {
+                    "low": prev["low"],
+                    "high": prev["high"],
+                    "mid": (prev["low"] + prev["high"]) / 2,
+                }
+
+    inside_bullish_ob = False
+    inside_bearish_ob = False
+
+    if bullish_ob:
+        inside_bullish_ob = bullish_ob["low"] <= price <= bullish_ob["high"]
+
+    if bearish_ob:
+        inside_bearish_ob = bearish_ob["low"] <= price <= bearish_ob["high"]
+
+    return {
+        "bullish_ob_active": bullish_ob is not None,
+        "bearish_ob_active": bearish_ob is not None,
+        "inside_bullish_ob": inside_bullish_ob,
+        "inside_bearish_ob": inside_bearish_ob,
+        "bullish_ob": bullish_ob,
+        "bearish_ob": bearish_ob,
+    }
+
+
+def detect_premium_discount(candles, lookback=100):
+    recent = candles[-lookback:]
+
+    range_high = max(c["high"] for c in recent)
+    range_low = min(c["low"] for c in recent)
+    equilibrium = (range_high + range_low) / 2
+    price = candles[-1]["close"]
+
+    if price < equilibrium:
+        zone = "DISCOUNT"
+    elif price > equilibrium:
+        zone = "PREMIUM"
+    else:
+        zone = "EQUILIBRIUM"
+
+    return {
+        "range_high": range_high,
+        "range_low": range_low,
+        "equilibrium": equilibrium,
+        "pd_zone": zone,
+    }
+
+
+def calculate_smc_score(bias, liquidity, structure, fvg, ob, pd):
+    score = 0
+    notes = []
+
+    if bias == "LONG":
+        if liquidity["low_sweep"]:
+            score += 12
+            notes.append("Bullish liquidity sweep detected")
+
+        if structure["bos_bullish"]:
+            score += 12
+            notes.append("Bullish BOS detected")
+
+        if structure["structure"] == "BULLISH":
+            score += 8
+            notes.append("Market structure is bullish")
+
+        if fvg["inside_bullish_fvg"]:
+            score += 8
+            notes.append("Price is inside bullish FVG")
+
+        if ob["inside_bullish_ob"]:
+            score += 8
+            notes.append("Price is inside bullish order block")
+
+        if pd["pd_zone"] == "DISCOUNT":
+            score += 10
+            notes.append("Price is in discount zone")
+
+    elif bias == "SHORT":
+        if liquidity["high_sweep"]:
+            score += 12
+            notes.append("Bearish liquidity sweep detected")
+
+        if structure["bos_bearish"]:
+            score += 12
+            notes.append("Bearish BOS detected")
+
+        if structure["structure"] == "BEARISH":
+            score += 8
+            notes.append("Market structure is bearish")
+
+        if fvg["inside_bearish_fvg"]:
+            score += 8
+            notes.append("Price is inside bearish FVG")
+
+        if ob["inside_bearish_ob"]:
+            score += 8
+            notes.append("Price is inside bearish order block")
+
+        if pd["pd_zone"] == "PREMIUM":
+            score += 10
+            notes.append("Price is in premium zone")
+
+    return {
+        "smc_score": min(score, 50),
+        "smc_notes": notes,
+    }
+
+
+# =====================================================
+# MAIN ANALYSIS ENGINE
+# =====================================================
+
 def analyze_market(symbol="BTCUSDT", interval="60"):
-    candles = get_bybit_candles(symbol=symbol, interval=interval, limit=200)
+    candles = get_bybit_candles(symbol=symbol, interval=interval, limit=250)
 
     closes = [c["close"] for c in candles]
+    volumes = [c["volume"] for c in candles]
+
     current_price = closes[-1]
 
     ema50 = ema(closes, 50)
     ema200 = ema(closes, 200)
     rsi14 = rsi(closes, 14)
     atr14 = atr(candles, 14)
+    volume_sma20 = sma(volumes, 20)
 
-    if ema50 is None or ema200 is None or rsi14 is None or atr14 is None:
+    if ema50 is None or ema200 is None or rsi14 is None or atr14 is None or volume_sma20 is None:
         return {
             "status": "error",
             "message": "Not enough data for analysis",
@@ -127,6 +423,7 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
     bearish_trend = current_price < ema50 < ema200
 
     extended = distance_from_ema50_atr > 1.2
+    volume_strong = volumes[-1] > volume_sma20
 
     if bullish_trend:
         trend = "BULLISH"
@@ -138,30 +435,144 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         trend = "NEUTRAL / CHOP"
         bias = "NONE"
 
+    # SMC analysis
+    swing_highs, swing_lows = find_swing_highs_lows(candles)
+    liquidity = detect_liquidity_sweep(candles, swing_highs, swing_lows)
+    structure = detect_market_structure(candles, swing_highs, swing_lows)
+    fvg = detect_fvg(candles)
+    ob = detect_order_blocks(candles)
+    pd = detect_premium_discount(candles)
+
+    smc = calculate_smc_score(bias, liquidity, structure, fvg, ob, pd)
+
+    # Technical score: max 35
+    technical_score = 0
+
+    if bias == "LONG":
+        if bullish_trend:
+            technical_score += 15
+        if 45 <= rsi14 <= 72:
+            technical_score += 8
+        if not extended:
+            technical_score += 7
+        if volume_strong:
+            technical_score += 5
+
+    elif bias == "SHORT":
+        if bearish_trend:
+            technical_score += 15
+        if 28 <= rsi14 <= 55:
+            technical_score += 8
+        if not extended:
+            technical_score += 7
+        if volume_strong:
+            technical_score += 5
+
+    # Risk score: max 15
+    risk_score = 0
+
+    if atr14 > 0:
+        if distance_from_ema50_atr <= 0.8:
+            risk_score = 15
+        elif distance_from_ema50_atr <= 1.2:
+            risk_score = 10
+        elif distance_from_ema50_atr <= 1.8:
+            risk_score = 6
+        else:
+            risk_score = 3
+
+    total_score = smc["smc_score"] + technical_score + risk_score
+
+    # Entry / SL / TP estimate
+    if bias == "LONG":
+        entry = current_price
+        stop_loss = current_price - atr14 * 1.5
+        tp1 = current_price + atr14 * 1.5
+        tp2 = current_price + atr14 * 2.5
+        tp3 = current_price + atr14 * 4.0
+        target = tp2
+        potential_pct = (target - current_price) / current_price * 100
+
+    elif bias == "SHORT":
+        entry = current_price
+        stop_loss = current_price + atr14 * 1.5
+        tp1 = current_price - atr14 * 1.5
+        tp2 = current_price - atr14 * 2.5
+        tp3 = current_price - atr14 * 4.0
+        target = tp2
+        potential_pct = (current_price - target) / current_price * 100
+
+    else:
+        entry = None
+        stop_loss = None
+        tp1 = None
+        tp2 = None
+        tp3 = None
+        target = None
+        potential_pct = 0
+
+    # Decision logic
     if trend == "NEUTRAL / CHOP":
         decision = "NO TRADE"
         action = "WAIT"
         reason = "Market is not in a clean trend. Avoid trading in chop."
         position = "$0"
         leverage = "None"
-    elif extended:
+
+    elif extended and smc["smc_score"] < 30:
         decision = "DO NOT CHASE"
         action = "WAIT FOR PULLBACK"
-        reason = "Trend exists, but price is too extended from EMA 50. Entry is late."
+        reason = "Trend exists, but price is extended from EMA50 and SMC confirmation is not strong enough."
+
+        if bias == "LONG":
+            if pd["pd_zone"] == "PREMIUM":
+                reason += " Price is in premium zone; buying here is expensive."
+            reason += " Wait for pullback into discount, bullish OB/FVG, or liquidity sweep."
+
+        elif bias == "SHORT":
+            if pd["pd_zone"] == "DISCOUNT":
+                reason += " Price is in discount zone; shorting here is late."
+            reason += " Wait for pullback into premium, bearish OB/FVG, or liquidity sweep."
+
         position = "$0"
         leverage = "None"
+
+    elif bias == "LONG" and total_score >= 75:
+        decision = "SMART LONG"
+        action = "PREPARE LONG"
+        reason = "Bullish trend with acceptable technical and SMC confirmation."
+
+        if smc["smc_notes"]:
+            reason += " " + "; ".join(smc["smc_notes"]) + "."
+
+        position = "Small test position only"
+        leverage = "Low / conservative"
+
+    elif bias == "SHORT" and total_score >= 75:
+        decision = "SMART SHORT"
+        action = "PREPARE SHORT"
+        reason = "Bearish trend with acceptable technical and SMC confirmation."
+
+        if smc["smc_notes"]:
+            reason += " " + "; ".join(smc["smc_notes"]) + "."
+
+        position = "Small test position only"
+        leverage = "Low / conservative"
+
     elif bias == "LONG":
         decision = "LONG BIAS"
         action = "WAIT FOR LONG TRIGGER"
-        reason = "Bullish trend detected. Wait for pullback to EMA/support and bullish confirmation."
+        reason = "Bullish trend detected, but full confirmation is not strong enough yet. Wait for pullback, sweep, bullish OB/FVG reaction, or better risk location."
         position = "Not yet"
         leverage = "Not yet"
+
     elif bias == "SHORT":
         decision = "SHORT BIAS"
         action = "WAIT FOR SHORT TRIGGER"
-        reason = "Bearish trend detected. Wait for pullback to EMA/resistance and bearish confirmation."
+        reason = "Bearish trend detected, but full confirmation is not strong enough yet. Wait for pullback, sweep, bearish OB/FVG reaction, or better risk location."
         position = "Not yet"
         leverage = "Not yet"
+
     else:
         decision = "WAIT"
         action = "NO ACTION"
@@ -169,36 +580,71 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         position = "$0"
         leverage = "None"
 
-    # Simple potential estimate using 2 ATR as expected move.
-    if bias == "LONG":
-        target = current_price + atr14 * 2
-        potential_pct = (target - current_price) / current_price * 100
-    elif bias == "SHORT":
-        target = current_price - atr14 * 2
-        potential_pct = (current_price - target) / current_price * 100
-    else:
-        target = None
-        potential_pct = 0
-
     return {
         "status": "ok",
         "symbol": symbol,
         "interval": interval,
         "price": current_price,
+
         "ema50": ema50,
         "ema200": ema200,
         "rsi14": rsi14,
         "atr14": atr14,
+        "volume": volumes[-1],
+        "volume_sma20": volume_sma20,
+        "volume_strong": volume_strong,
+
         "distance_from_ema50_atr": distance_from_ema50_atr,
         "distance_from_ema50_pct": distance_from_ema50_pct,
+
         "trend": trend,
         "bias": bias,
         "extended": extended,
+
+        "market_structure": structure["structure"],
+        "bos_bullish": structure["bos_bullish"],
+        "bos_bearish": structure["bos_bearish"],
+        "last_swing_high": structure["last_swing_high"],
+        "last_swing_low": structure["last_swing_low"],
+
+        "recent_high": liquidity["recent_high"],
+        "recent_low": liquidity["recent_low"],
+        "high_sweep": liquidity["high_sweep"],
+        "low_sweep": liquidity["low_sweep"],
+
+        "pd_zone": pd["pd_zone"],
+        "range_high": pd["range_high"],
+        "range_low": pd["range_low"],
+        "equilibrium": pd["equilibrium"],
+
+        "bullish_fvg_active": fvg["bullish_fvg_active"],
+        "bearish_fvg_active": fvg["bearish_fvg_active"],
+        "inside_bullish_fvg": fvg["inside_bullish_fvg"],
+        "inside_bearish_fvg": fvg["inside_bearish_fvg"],
+
+        "bullish_ob_active": ob["bullish_ob_active"],
+        "bearish_ob_active": ob["bearish_ob_active"],
+        "inside_bullish_ob": ob["inside_bullish_ob"],
+        "inside_bearish_ob": ob["inside_bearish_ob"],
+
+        "smc_score": smc["smc_score"],
+        "smc_notes": smc["smc_notes"],
+        "technical_score": technical_score,
+        "risk_score": risk_score,
+        "total_score": total_score,
+
         "decision": decision,
         "action": action,
         "reason": reason,
+
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
         "target": target,
         "potential_pct": potential_pct,
+
         "suggested_position": position,
         "suggested_leverage": leverage,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -306,10 +752,14 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
         decision_color = "#7c3aed"
     elif decision == "NO TRADE":
         decision_color = "#6b7280"
-    elif decision == "LONG BIAS":
+    elif decision == "SMART LONG":
         decision_color = "#16a34a"
-    elif decision == "SHORT BIAS":
+    elif decision == "SMART SHORT":
         decision_color = "#dc2626"
+    elif decision == "LONG BIAS":
+        decision_color = "#15803d"
+    elif decision == "SHORT BIAS":
+        decision_color = "#b91c1c"
     else:
         decision_color = "#2563eb"
 
@@ -317,6 +767,19 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
         if value is None:
             return "-"
         return f"{value:,.{decimals}f}"
+
+    def yes_no(value):
+        return "YES" if value else "NO"
+
+    smc_notes_html = ""
+
+    if data["smc_notes"]:
+        smc_notes_html = "<ul>"
+        for note in data["smc_notes"]:
+            smc_notes_html += f"<li>{note}</li>"
+        smc_notes_html += "</ul>"
+    else:
+        smc_notes_html = "<p>No strong SMC confirmation yet.</p>"
 
     html = f"""
     <html>
@@ -331,7 +794,7 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                 padding: 24px;
             }}
             .container {{
-                max-width: 900px;
+                max-width: 980px;
                 margin: auto;
             }}
             .card {{
@@ -356,6 +819,11 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                 grid-template-columns: repeat(2, 1fr);
                 gap: 12px;
             }}
+            .grid3 {{
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 12px;
+            }}
             .item {{
                 background: #1f2937;
                 padding: 12px;
@@ -374,8 +842,15 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                 font-size: 18px;
                 line-height: 1.5;
             }}
+            .score {{
+                font-size: 24px;
+                font-weight: bold;
+            }}
             a {{
                 color: #60a5fa;
+            }}
+            ul {{
+                line-height: 1.7;
             }}
         </style>
     </head>
@@ -387,6 +862,28 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                 <div class="decision">{data["decision"]}</div>
                 <h2>Action: {data["action"]}</h2>
                 <p class="reason">{data["reason"]}</p>
+            </div>
+
+            <div class="card">
+                <h2>Signal Quality Score</h2>
+                <div class="grid3">
+                    <div class="item">
+                        <div class="label">SMC Score</div>
+                        <div class="score">{data["smc_score"]} / 50</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">Technical Score</div>
+                        <div class="score">{data["technical_score"]} / 35</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">Risk Score</div>
+                        <div class="score">{data["risk_score"]} / 15</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">Total Score</div>
+                        <div class="score">{data["total_score"]} / 100</div>
+                    </div>
+                </div>
             </div>
 
             <div class="card">
@@ -406,9 +903,58 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                     </div>
                     <div class="item">
                         <div class="label">Extended From EMA50</div>
-                        <div class="value">{'YES' if data["extended"] else 'NO'}</div>
+                        <div class="value">{yes_no(data["extended"])}</div>
                     </div>
                 </div>
+            </div>
+
+            <div class="card">
+                <h2>Smart Money Concepts</h2>
+                <div class="grid">
+                    <div class="item">
+                        <div class="label">Market Structure</div>
+                        <div class="value">{data["market_structure"]}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">PD Zone</div>
+                        <div class="value">{data["pd_zone"]}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">Bullish BOS</div>
+                        <div class="value">{yes_no(data["bos_bullish"])}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">Bearish BOS</div>
+                        <div class="value">{yes_no(data["bos_bearish"])}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">Low Sweep</div>
+                        <div class="value">{yes_no(data["low_sweep"])}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">High Sweep</div>
+                        <div class="value">{yes_no(data["high_sweep"])}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">Inside Bullish FVG</div>
+                        <div class="value">{yes_no(data["inside_bullish_fvg"])}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">Inside Bearish FVG</div>
+                        <div class="value">{yes_no(data["inside_bearish_fvg"])}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">Inside Bullish OB</div>
+                        <div class="value">{yes_no(data["inside_bullish_ob"])}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">Inside Bearish OB</div>
+                        <div class="value">{yes_no(data["inside_bearish_ob"])}</div>
+                    </div>
+                </div>
+
+                <h3>SMC Notes</h3>
+                {smc_notes_html}
             </div>
 
             <div class="card">
@@ -438,15 +984,35 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                         <div class="label">Distance From EMA50 %</div>
                         <div class="value">{fmt(data["distance_from_ema50_pct"])}%</div>
                     </div>
+                    <div class="item">
+                        <div class="label">Volume Strong</div>
+                        <div class="value">{yes_no(data["volume_strong"])}</div>
+                    </div>
                 </div>
             </div>
 
             <div class="card">
-                <h2>Potential Estimate</h2>
+                <h2>Trade Plan Estimate</h2>
                 <div class="grid">
                     <div class="item">
-                        <div class="label">Estimated Target</div>
-                        <div class="value">{fmt(data["target"])}</div>
+                        <div class="label">Entry Estimate</div>
+                        <div class="value">{fmt(data["entry"])}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">Stop Loss</div>
+                        <div class="value">{fmt(data["stop_loss"])}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">TP1</div>
+                        <div class="value">{fmt(data["tp1"])}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">TP2</div>
+                        <div class="value">{fmt(data["tp2"])}</div>
+                    </div>
+                    <div class="item">
+                        <div class="label">TP3</div>
+                        <div class="value">{fmt(data["tp3"])}</div>
                     </div>
                     <div class="item">
                         <div class="label">Potential Move</div>
