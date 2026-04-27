@@ -1376,7 +1376,7 @@ def get_bybit_kline(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 
 
 
 @app.get("/bybit/analyze/{symbol}")
-def get_analysis(symbol: str = "BTCUSDT", interval: str = "60", ai: bool = False, position_side: str = "NONE", position_entry: Optional[float] = None):
+def get_analysis(symbol: str = "BTCUSDT", interval: str = "60", ai: bool = False, position_side: str = "NONE", position_entry: Optional[str] = None):
     symbol = symbol.upper()
     data = analyze_market(symbol=symbol, interval=interval, position_side=position_side, position_entry=position_entry)
 
@@ -1388,7 +1388,7 @@ def get_analysis(symbol: str = "BTCUSDT", interval: str = "60", ai: bool = False
 
 
 @app.get("/bybit/ai/{symbol}")
-def get_ai_analysis(symbol: str = "BTCUSDT", interval: str = "60", position_side: str = "NONE", position_entry: Optional[float] = None):
+def get_ai_analysis(symbol: str = "BTCUSDT", interval: str = "60", position_side: str = "NONE", position_entry: Optional[str] = None):
     symbol = symbol.upper()
     data = analyze_market(symbol=symbol, interval=interval, position_side=position_side, position_entry=position_entry)
 
@@ -1408,7 +1408,7 @@ def get_ai_analysis(symbol: str = "BTCUSDT", interval: str = "60", position_side
 
 
 @app.get("/bybit/chart-data/{symbol}")
-def get_chart_data(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 180, position_side: str = "NONE", position_entry: Optional[float] = None):
+def get_chart_data(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 180, position_side: str = "NONE", position_entry: Optional[str] = None):
     symbol = symbol.upper()
     limit = max(60, min(limit, 300))
 
@@ -1426,7 +1426,7 @@ def get_chart_data(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 1
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(symbol: str = "BTCUSDT", interval: str = "60", position_side: str = "NONE", position_entry: Optional[float] = None):
+def dashboard(symbol: str = "BTCUSDT", interval: str = "60", position_side: str = "NONE", position_entry: Optional[str] = None):
     symbol = symbol.upper()
     interval = str(interval)
     data = analyze_market(symbol=symbol, interval=interval, position_side=position_side, position_entry=position_entry)
@@ -1848,7 +1848,7 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60", position_side: str 
 
 
 @app.get("/chart", response_class=HTMLResponse)
-def visual_chart(symbol: str = "BTCUSDT", interval: str = "60", position_side: str = "NONE", position_entry: Optional[float] = None):
+def visual_chart(symbol: str = "BTCUSDT", interval: str = "60", position_side: str = "NONE", position_entry: Optional[str] = None):
     symbol = symbol.upper()
 
     data = analyze_market(symbol=symbol, interval=interval, position_side=position_side, position_entry=position_entry)
