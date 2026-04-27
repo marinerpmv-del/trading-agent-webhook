@@ -522,6 +522,17 @@ def compact_market_data_for_ai(data):
         "tp3": data.get("tp3"),
         "suggested_position": data.get("suggested_position"),
         "suggested_leverage": data.get("suggested_leverage"),
+        "position_side": data.get("position_side"),
+        "position_entry": data.get("position_entry"),
+        "has_position": data.get("has_position"),
+        "unrealized_pct": data.get("unrealized_pct"),
+        "profit_atr": data.get("profit_atr"),
+        "manager_stop": data.get("manager_stop"),
+        "partial_take_level": data.get("partial_take_level"),
+        "trailing_activation": data.get("trailing_activation"),
+        "trailing_distance": data.get("trailing_distance"),
+        "invalidation_level": data.get("invalidation_level"),
+        "manager_note": data.get("manager_note"),
     }
 
 
@@ -715,7 +726,18 @@ def log_ai_decision(data, ai_brief):
 # MAIN ANALYSIS ENGINE
 # =====================================================
 
-def analyze_market(symbol="BTCUSDT", interval="60"):
+def analyze_market(symbol="BTCUSDT", interval="60", position_side="NONE", position_entry=None):
+    """
+    Main analysis engine.
+
+    First upgrade:
+    - separates NO POSITION logic from POSITION MANAGEMENT logic;
+    - adds EARLY LONG / EARLY SHORT before perfect confirmation;
+    - adds DO NOT CHASE protection when price is too extended;
+    - returns practical management commands if a position is already open.
+
+    Note: this does NOT place real orders. It only returns analysis and suggested actions.
+    """
     candles = get_bybit_candles(symbol=symbol, interval=interval, limit=250)
 
     closes = [c["close"] for c in candles]
@@ -735,6 +757,17 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
             "message": "Not enough data for analysis",
         }
 
+    position_side = (position_side or "NONE").upper().strip()
+    if position_side not in ["NONE", "LONG", "SHORT"]:
+        position_side = "NONE"
+
+    try:
+        position_entry = float(position_entry) if position_entry not in [None, ""] else None
+    except Exception:
+        position_entry = None
+
+    has_position = position_side in ["LONG", "SHORT"] and position_entry is not None and position_entry > 0
+
     distance_from_ema50_atr = abs(current_price - ema50) / atr14
     distance_from_ema50_pct = abs(current_price - ema50) / current_price * 100
 
@@ -742,6 +775,7 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
     bearish_trend = current_price < ema50 < ema200
 
     extended = distance_from_ema50_atr > 1.2
+    very_extended = distance_from_ema50_atr > 1.8
     volume_strong = volumes[-1] > volume_sma20
 
     if bullish_trend:
@@ -802,7 +836,9 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
 
     total_score = smc["smc_score"] + technical_score + risk_score
 
-    # Entry / SL / TP estimate
+    # Entry / SL / TP estimate.
+    # For new setups, the entry estimate is current price.
+    # For an existing position, trade plan is still based on the active market, but management fields below are based on actual entry.
     if bias == "LONG":
         entry = current_price
         stop_loss = current_price - atr14 * 1.5
@@ -830,83 +866,261 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         target = None
         potential_pct = 0
 
-    # Decision logic
+    # Position manager calculations
+    unrealized_pct = None
+    profit_atr = None
+    manager_stop = None
+    partial_take_level = None
+    trailing_activation = None
+    trailing_distance = None
+    invalidation_level = None
+
+    if has_position and atr14 > 0:
+        if position_side == "LONG":
+            unrealized_pct = (current_price - position_entry) / position_entry * 100
+            profit_atr = (current_price - position_entry) / atr14
+            invalidation_level = min(position_entry - atr14 * 0.6, current_price - atr14 * 1.2)
+            manager_stop = position_entry if profit_atr >= 0.55 else max(position_entry - atr14 * 1.2, current_price - atr14 * 1.5)
+            partial_take_level = position_entry + atr14 * 1.5
+            trailing_activation = position_entry + atr14 * 1.2
+            trailing_distance = atr14 * 0.8
+
+        elif position_side == "SHORT":
+            unrealized_pct = (position_entry - current_price) / position_entry * 100
+            profit_atr = (position_entry - current_price) / atr14
+            invalidation_level = max(position_entry + atr14 * 0.6, current_price + atr14 * 1.2)
+            manager_stop = position_entry if profit_atr >= 0.55 else min(position_entry + atr14 * 1.2, current_price + atr14 * 1.5)
+            partial_take_level = position_entry - atr14 * 1.5
+            trailing_activation = position_entry - atr14 * 1.2
+            trailing_distance = atr14 * 0.8
+
+    # Decision logic thresholds
     min_smc_for_smart_signal = 30
     min_total_for_smart_signal = 75
+    min_total_for_early_signal = 55
+    min_technical_for_early_signal = 20
+    min_risk_for_early_signal = 10
 
-    if trend == "NEUTRAL / CHOP":
+    bullish_zone_reaction = (
+        liquidity["low_sweep"]
+        or fvg["inside_bullish_fvg"]
+        or ob["inside_bullish_ob"]
+        or pd["pd_zone"] == "DISCOUNT"
+    )
+    bearish_zone_reaction = (
+        liquidity["high_sweep"]
+        or fvg["inside_bearish_fvg"]
+        or ob["inside_bearish_ob"]
+        or pd["pd_zone"] == "PREMIUM"
+    )
+
+    long_confirmed = bias == "LONG" and total_score >= min_total_for_smart_signal and smc["smc_score"] >= min_smc_for_smart_signal
+    short_confirmed = bias == "SHORT" and total_score >= min_total_for_smart_signal and smc["smc_score"] >= min_smc_for_smart_signal
+
+    early_long = (
+        bias == "LONG"
+        and total_score >= min_total_for_early_signal
+        and technical_score >= min_technical_for_early_signal
+        and risk_score >= min_risk_for_early_signal
+        and bullish_zone_reaction
+        and not very_extended
+    )
+
+    early_short = (
+        bias == "SHORT"
+        and total_score >= min_total_for_early_signal
+        and technical_score >= min_technical_for_early_signal
+        and risk_score >= min_risk_for_early_signal
+        and bearish_zone_reaction
+        and not very_extended
+    )
+
+    late_long = bias == "LONG" and (very_extended or (extended and pd["pd_zone"] == "PREMIUM" and smc["smc_score"] < min_smc_for_smart_signal))
+    late_short = bias == "SHORT" and (very_extended or (extended and pd["pd_zone"] == "DISCOUNT" and smc["smc_score"] < min_smc_for_smart_signal))
+
+    # Default fields
+    position = "$0"
+    leverage = "None"
+    manager_note = "No active position provided. Agent is evaluating new entries only."
+
+    # 1) Existing position management comes FIRST.
+    if has_position:
+        manager_note = (
+            f"Managing existing {position_side} from {fmt_number(position_entry)}. "
+            f"Unrealized result is about {fmt_number(unrealized_pct)}%, or {fmt_number(profit_atr)} ATR."
+        )
+
+        if position_side == "LONG":
+            if bias == "SHORT" and (structure["bos_bearish"] or total_score >= 70):
+                decision = "EXIT LONG"
+                action = "CLOSE OR REDUCE LONG"
+                reason = (
+                    "Existing LONG is under pressure: current market bias is turning against the position. "
+                    "Reduce risk instead of hoping. Watch for bearish BOS or loss of support."
+                )
+                position = "Reduce / close"
+                leverage = "No adding"
+
+            elif profit_atr is not None and profit_atr >= 1.5:
+                decision = "TAKE PARTIAL"
+                action = "TAKE 30-50% PROFIT / TRAIL REMAINDER"
+                reason = (
+                    "LONG is already in good profit. Do not let a winner turn into a loser. "
+                    "Take partial profit and trail the remaining position."
+                )
+                position = "Hold remainder only"
+                leverage = "No adding"
+
+            elif profit_atr is not None and profit_atr >= 0.55:
+                decision = "HOLD LONG"
+                action = "MOVE SL TO BREAKEVEN"
+                reason = (
+                    "LONG is working but not fully extended yet. Move stop-loss to breakeven or small profit. "
+                    "Hold while price remains above entry/support."
+                )
+                position = "Hold"
+                leverage = "No adding"
+
+            elif current_price < invalidation_level:
+                decision = "EXIT LONG"
+                action = "INVALIDATED"
+                reason = "LONG idea is invalidated because price moved below the suggested invalidation area."
+                position = "Close"
+                leverage = "None"
+
+            else:
+                decision = "HOLD LONG"
+                action = "HOLD / KEEP PROTECTIVE SL"
+                reason = (
+                    "LONG is still alive, but profit is not large enough to force breakeven. "
+                    "Keep protective stop below invalidation and do not add until market confirms."
+                )
+                position = "Hold small"
+                leverage = "Low / conservative"
+
+        elif position_side == "SHORT":
+            if bias == "LONG" and (structure["bos_bullish"] or total_score >= 70):
+                decision = "EXIT SHORT"
+                action = "CLOSE OR REDUCE SHORT"
+                reason = (
+                    "Existing SHORT is under pressure: current market bias is turning against the position. "
+                    "Reduce risk instead of hoping. Watch for bullish BOS or reclaim of resistance."
+                )
+                position = "Reduce / close"
+                leverage = "No adding"
+
+            elif profit_atr is not None and profit_atr >= 1.5:
+                decision = "TAKE PARTIAL"
+                action = "TAKE 30-50% PROFIT / TRAIL REMAINDER"
+                reason = (
+                    "SHORT is already in good profit. Take partial profit and trail the remaining position."
+                )
+                position = "Hold remainder only"
+                leverage = "No adding"
+
+            elif profit_atr is not None and profit_atr >= 0.55:
+                decision = "HOLD SHORT"
+                action = "MOVE SL TO BREAKEVEN"
+                reason = (
+                    "SHORT is working but not fully extended yet. Move stop-loss to breakeven or small profit. "
+                    "Hold while price remains below entry/resistance."
+                )
+                position = "Hold"
+                leverage = "No adding"
+
+            elif current_price > invalidation_level:
+                decision = "EXIT SHORT"
+                action = "INVALIDATED"
+                reason = "SHORT idea is invalidated because price moved above the suggested invalidation area."
+                position = "Close"
+                leverage = "None"
+
+            else:
+                decision = "HOLD SHORT"
+                action = "HOLD / KEEP PROTECTIVE SL"
+                reason = (
+                    "SHORT is still alive, but profit is not large enough to force breakeven. "
+                    "Keep protective stop above invalidation and do not add until market confirms."
+                )
+                position = "Hold small"
+                leverage = "Low / conservative"
+
+    # 2) No-position entry logic.
+    elif trend == "NEUTRAL / CHOP":
         decision = "NO TRADE"
         action = "WAIT"
         reason = "Market is not in a clean trend. Avoid trading in chop."
         position = "$0"
         leverage = "None"
 
-    elif extended and smc["smc_score"] < min_smc_for_smart_signal:
-        decision = "DO NOT CHASE"
+    elif long_confirmed:
+        decision = "CONFIRMED LONG"
+        action = "PREPARE LONG"
+        reason = "Bullish trend with acceptable technical, risk, and SMC confirmation."
+        if smc["smc_notes"]:
+            reason += " " + "; ".join(smc["smc_notes"]) + "."
+        position = "Small / normal test position"
+        leverage = "Low / conservative"
+
+    elif short_confirmed:
+        decision = "CONFIRMED SHORT"
+        action = "PREPARE SHORT"
+        reason = "Bearish trend with acceptable technical, risk, and SMC confirmation."
+        if smc["smc_notes"]:
+            reason += " " + "; ".join(smc["smc_notes"]) + "."
+        position = "Small / normal test position"
+        leverage = "Low / conservative"
+
+    elif early_long:
+        decision = "EARLY LONG"
+        action = "SMALL SIZE ONLY"
+        reason = (
+            "Early bullish setup: trend/risk are acceptable and price is reacting from a useful zone, "
+            "but SMC confirmation is not strong enough for a confirmed long. This is an early entry, not a full-size signal."
+        )
+        if smc["smc_notes"]:
+            reason += " " + "; ".join(smc["smc_notes"]) + "."
+        position = "Small test position only"
+        leverage = "Low only"
+
+    elif early_short:
+        decision = "EARLY SHORT"
+        action = "SMALL SIZE ONLY"
+        reason = (
+            "Early bearish setup: trend/risk are acceptable and price is reacting from a useful zone, "
+            "but SMC confirmation is not strong enough for a confirmed short. This is an early entry, not a full-size signal."
+        )
+        if smc["smc_notes"]:
+            reason += " " + "; ".join(smc["smc_notes"]) + "."
+        position = "Small test position only"
+        leverage = "Low only"
+
+    elif late_long:
+        decision = "LONG BIAS / DO NOT CHASE"
         action = "WAIT FOR PULLBACK"
-        reason = "Trend exists, but price is extended from EMA50 and SMC confirmation is not strong enough."
-
-        if bias == "LONG":
-            if pd["pd_zone"] == "PREMIUM":
-                reason += " Price is in premium zone; buying here is expensive."
-            reason += " Wait for pullback into discount, bullish OB/FVG, liquidity sweep, or bullish rejection."
-
-        elif bias == "SHORT":
-            if pd["pd_zone"] == "DISCOUNT":
-                reason += " Price is in discount zone; shorting here is late."
-            reason += " Wait for pullback into premium, bearish OB/FVG, liquidity sweep, or bearish rejection."
-
+        reason = (
+            "Bullish bias exists, but the entry is late. Price is extended and/or in premium with weak SMC confirmation. "
+            "Do not buy someone else's take-profit. Wait for pullback, low sweep, bullish OB/FVG reaction, or better risk location."
+        )
         position = "$0"
         leverage = "None"
 
-    elif bias == "LONG" and total_score >= min_total_for_smart_signal and smc["smc_score"] >= min_smc_for_smart_signal:
-        decision = "SMART LONG"
-        action = "PREPARE LONG"
-        reason = "Bullish trend with acceptable technical, risk, and SMC confirmation."
-
-        if smc["smc_notes"]:
-            reason += " " + "; ".join(smc["smc_notes"]) + "."
-
-        position = "Small test position only"
-        leverage = "Low / conservative"
-
-    elif bias == "SHORT" and total_score >= min_total_for_smart_signal and smc["smc_score"] >= min_smc_for_smart_signal:
-        decision = "SMART SHORT"
-        action = "PREPARE SHORT"
-        reason = "Bearish trend with acceptable technical, risk, and SMC confirmation."
-
-        if smc["smc_notes"]:
-            reason += " " + "; ".join(smc["smc_notes"]) + "."
-
-        position = "Small test position only"
-        leverage = "Low / conservative"
-
-    elif bias == "LONG" and total_score >= min_total_for_smart_signal and smc["smc_score"] < min_smc_for_smart_signal:
-        decision = "LONG BIAS"
-        action = "WAIT FOR SMC TRIGGER"
+    elif late_short:
+        decision = "SHORT BIAS / DO NOT CHASE"
+        action = "WAIT FOR PULLBACK"
         reason = (
-            "Bullish trend and risk conditions are good, but SMC confirmation is still not strong enough. "
-            "Do not chase. Wait for low sweep, bullish BOS, reaction from bullish FVG/OB, or pullback into discount."
+            "Bearish bias exists, but the entry is late. Price is extended and/or in discount with weak SMC confirmation. "
+            "Do not short after the easy move. Wait for pullback, high sweep, bearish OB/FVG reaction, or better risk location."
         )
-        position = "Not yet"
-        leverage = "Not yet"
-
-    elif bias == "SHORT" and total_score >= min_total_for_smart_signal and smc["smc_score"] < min_smc_for_smart_signal:
-        decision = "SHORT BIAS"
-        action = "WAIT FOR SMC TRIGGER"
-        reason = (
-            "Bearish trend and risk conditions are good, but SMC confirmation is still not strong enough. "
-            "Do not chase. Wait for high sweep, bearish BOS, reaction from bearish FVG/OB, or pullback into premium."
-        )
-        position = "Not yet"
-        leverage = "Not yet"
+        position = "$0"
+        leverage = "None"
 
     elif bias == "LONG":
         decision = "LONG BIAS"
         action = "WAIT FOR LONG TRIGGER"
         reason = (
-            "Bullish trend detected, but full confirmation is not strong enough yet. "
-            "Wait for pullback, low sweep, bullish OB/FVG reaction, or better risk location."
+            "Bullish trend detected, but entry quality is not good enough yet. "
+            "Wait for pullback, low sweep, bullish OB/FVG reaction, or stronger SMC confirmation."
         )
         position = "Not yet"
         leverage = "Not yet"
@@ -915,8 +1129,8 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         decision = "SHORT BIAS"
         action = "WAIT FOR SHORT TRIGGER"
         reason = (
-            "Bearish trend detected, but full confirmation is not strong enough yet. "
-            "Wait for pullback, high sweep, bearish OB/FVG reaction, or better risk location."
+            "Bearish trend detected, but entry quality is not good enough yet. "
+            "Wait for pullback, high sweep, bearish OB/FVG reaction, or stronger SMC confirmation."
         )
         position = "Not yet"
         leverage = "Not yet"
@@ -934,6 +1148,18 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         "interval": interval,
         "price": current_price,
 
+        "position_side": position_side,
+        "position_entry": position_entry,
+        "has_position": has_position,
+        "unrealized_pct": unrealized_pct,
+        "profit_atr": profit_atr,
+        "manager_stop": manager_stop,
+        "partial_take_level": partial_take_level,
+        "trailing_activation": trailing_activation,
+        "trailing_distance": trailing_distance,
+        "invalidation_level": invalidation_level,
+        "manager_note": manager_note,
+
         "ema50": ema50,
         "ema200": ema200,
         "rsi14": rsi14,
@@ -948,6 +1174,7 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         "trend": trend,
         "bias": bias,
         "extended": extended,
+        "very_extended": very_extended,
 
         "market_structure": structure["structure"],
         "bos_bullish": structure["bos_bullish"],
@@ -1149,9 +1376,9 @@ def get_bybit_kline(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 
 
 
 @app.get("/bybit/analyze/{symbol}")
-def get_analysis(symbol: str = "BTCUSDT", interval: str = "60", ai: bool = False):
+def get_analysis(symbol: str = "BTCUSDT", interval: str = "60", ai: bool = False, position_side: str = "NONE", position_entry: Optional[float] = None):
     symbol = symbol.upper()
-    data = analyze_market(symbol=symbol, interval=interval)
+    data = analyze_market(symbol=symbol, interval=interval, position_side=position_side, position_entry=position_entry)
 
     if ai and data.get("status") == "ok":
         data["ai_market_brief"] = generate_ai_market_brief(data)
@@ -1161,9 +1388,9 @@ def get_analysis(symbol: str = "BTCUSDT", interval: str = "60", ai: bool = False
 
 
 @app.get("/bybit/ai/{symbol}")
-def get_ai_analysis(symbol: str = "BTCUSDT", interval: str = "60"):
+def get_ai_analysis(symbol: str = "BTCUSDT", interval: str = "60", position_side: str = "NONE", position_entry: Optional[float] = None):
     symbol = symbol.upper()
-    data = analyze_market(symbol=symbol, interval=interval)
+    data = analyze_market(symbol=symbol, interval=interval, position_side=position_side, position_entry=position_entry)
 
     if data.get("status") != "ok":
         return data
@@ -1181,11 +1408,11 @@ def get_ai_analysis(symbol: str = "BTCUSDT", interval: str = "60"):
 
 
 @app.get("/bybit/chart-data/{symbol}")
-def get_chart_data(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 180):
+def get_chart_data(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 180, position_side: str = "NONE", position_entry: Optional[float] = None):
     symbol = symbol.upper()
     limit = max(60, min(limit, 300))
 
-    analysis = analyze_market(symbol=symbol, interval=interval)
+    analysis = analyze_market(symbol=symbol, interval=interval, position_side=position_side, position_entry=position_entry)
     chart_data = prepare_chart_payload(symbol=symbol, interval=interval, limit=limit)
 
     return {
@@ -1199,10 +1426,10 @@ def get_chart_data(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 1
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
+def dashboard(symbol: str = "BTCUSDT", interval: str = "60", position_side: str = "NONE", position_entry: Optional[float] = None):
     symbol = symbol.upper()
     interval = str(interval)
-    data = analyze_market(symbol=symbol, interval=interval)
+    data = analyze_market(symbol=symbol, interval=interval, position_side=position_side, position_entry=position_entry)
 
     if data["status"] != "ok":
         return f"""
@@ -1262,6 +1489,11 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
     interval_options_html = interval_select_html(data["interval"])
     symbol_datalist = symbol_datalist_html()
     interval_display = interval_label(data["interval"])
+    position_side_options_html = "".join(
+        f'<option value="{side}"{" selected" if data.get("position_side") == side else ""}>{side}</option>'
+        for side in ["NONE", "LONG", "SHORT"]
+    )
+    position_entry_value = "" if data.get("position_entry") is None else str(data.get("position_entry"))
 
     decision_log_rows = ""
     filtered_log_items = [
@@ -1443,8 +1675,16 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                     <label class="label" for="interval">Timeframe</label>
                     <select id="interval" name="interval">{interval_options_html}</select>
                 </div>
+                <div class="control-group">
+                    <label class="label" for="position_side">Position</label>
+                    <select id="position_side" name="position_side">{position_side_options_html}</select>
+                </div>
+                <div class="control-group">
+                    <label class="label" for="position_entry">Entry price</label>
+                    <input id="position_entry" name="position_entry" value="{html.escape(position_entry_value)}" placeholder="optional">
+                </div>
                 <button type="submit">Analyze</button>
-                <a href="/chart?symbol={html.escape(data["symbol"])}&interval={html.escape(data["interval"])}">Open Visual Chart</a>
+                <a href="/chart?symbol={html.escape(data["symbol"])}&interval={html.escape(data["interval"])}&position_side={html.escape(str(data.get("position_side")))}&position_entry={html.escape(position_entry_value)}">Open Visual Chart</a>
             </form>
 
             <div class="top-links">
@@ -1457,6 +1697,21 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                 <div class="decision">{html.escape(data["decision"])}</div>
                 <h2>Action: {html.escape(data["action"])}</h2>
                 <p class="reason">{html.escape(data["reason"])}</p>
+            </div>
+
+            <div class="card">
+                <h2>Position Manager</h2>
+                <p class="reason">{html.escape(data.get("manager_note", "-"))}</p>
+                <div class="grid">
+                    <div class="item"><div class="label">Position Side</div><div class="value">{html.escape(str(data.get("position_side", "NONE")))}</div></div>
+                    <div class="item"><div class="label">Position Entry</div><div class="value">{fmt(data.get("position_entry"))}</div></div>
+                    <div class="item"><div class="label">Unrealized %</div><div class="value">{fmt(data.get("unrealized_pct"))}%</div></div>
+                    <div class="item"><div class="label">Profit in ATR</div><div class="value">{fmt(data.get("profit_atr"))}</div></div>
+                    <div class="item"><div class="label">Suggested Manager Stop</div><div class="value">{fmt(data.get("manager_stop"))}</div></div>
+                    <div class="item"><div class="label">Invalidation Level</div><div class="value">{fmt(data.get("invalidation_level"))}</div></div>
+                    <div class="item"><div class="label">Partial Take Level</div><div class="value">{fmt(data.get("partial_take_level"))}</div></div>
+                    <div class="item"><div class="label">Trailing Activation / Distance</div><div class="value">{fmt(data.get("trailing_activation"))} / {fmt(data.get("trailing_distance"))}</div></div>
+                </div>
             </div>
 
             <div class="card">
@@ -1593,10 +1848,10 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
 
 
 @app.get("/chart", response_class=HTMLResponse)
-def visual_chart(symbol: str = "BTCUSDT", interval: str = "60"):
+def visual_chart(symbol: str = "BTCUSDT", interval: str = "60", position_side: str = "NONE", position_entry: Optional[float] = None):
     symbol = symbol.upper()
 
-    data = analyze_market(symbol=symbol, interval=interval)
+    data = analyze_market(symbol=symbol, interval=interval, position_side=position_side, position_entry=position_entry)
 
     if data["status"] != "ok":
         return f"""
@@ -1616,6 +1871,11 @@ def visual_chart(symbol: str = "BTCUSDT", interval: str = "60"):
     interval_options_html = interval_select_html(interval)
     symbol_datalist = symbol_datalist_html()
     interval_display = interval_label(interval)
+    position_side_options_html = "".join(
+        f'<option value="{side}"{" selected" if data.get("position_side") == side else ""}>{side}</option>'
+        for side in ["NONE", "LONG", "SHORT"]
+    )
+    position_entry_value = "" if data.get("position_entry") is None else str(data.get("position_entry"))
 
     candles_json = json.dumps(chart_payload["candles"])
     ema50_json = json.dumps(chart_payload["ema50"])
@@ -1813,8 +2073,16 @@ def visual_chart(symbol: str = "BTCUSDT", interval: str = "60"):
                         <label class="label" for="interval">Timeframe</label>
                         <select id="interval" name="interval">{interval_options_html}</select>
                     </div>
+                    <div class="control-group">
+                        <label class="label" for="position_side">Position</label>
+                        <select id="position_side" name="position_side">{position_side_options_html}</select>
+                    </div>
+                    <div class="control-group">
+                        <label class="label" for="position_entry">Entry price</label>
+                        <input id="position_entry" name="position_entry" value="{html.escape(position_entry_value)}" placeholder="optional">
+                    </div>
                     <button type="submit">Update Chart</button>
-                    <a href="/dashboard?symbol={html.escape(symbol)}&interval={html.escape(interval)}">Open Dashboard</a>
+                    <a href="/dashboard?symbol={html.escape(symbol)}&interval={html.escape(interval)}&position_side={html.escape(str(data.get("position_side")))}&position_entry={html.escape(position_entry_value)}">Open Dashboard</a>
                 </form>
 
                 <div id="chart"></div>
@@ -1850,6 +2118,21 @@ def visual_chart(symbol: str = "BTCUSDT", interval: str = "60"):
                         </div>
                     </div>
                     <p>{html.escape(data["reason"])}</p>
+                </div>
+
+                <div class="card">
+                    <h2>Position Manager</h2>
+                    <p>{html.escape(data.get("manager_note", "-"))}</p>
+                    <div class="grid">
+                        <div><div class="label">Position</div><div class="value">{html.escape(str(data.get("position_side", "NONE")))}</div></div>
+                        <div><div class="label">Entry</div><div class="value">{fmt_number(data.get("position_entry"))}</div></div>
+                        <div><div class="label">Unrealized</div><div class="value">{fmt_number(data.get("unrealized_pct"))}%</div></div>
+                        <div><div class="label">Profit ATR</div><div class="value">{fmt_number(data.get("profit_atr"))}</div></div>
+                        <div><div class="label">Manager Stop</div><div class="value">{fmt_number(data.get("manager_stop"))}</div></div>
+                        <div><div class="label">Invalidation</div><div class="value">{fmt_number(data.get("invalidation_level"))}</div></div>
+                        <div><div class="label">Partial Take</div><div class="value">{fmt_number(data.get("partial_take_level"))}</div></div>
+                        <div><div class="label">Trail Act / Dist</div><div class="value">{fmt_number(data.get("trailing_activation"))} / {fmt_number(data.get("trailing_distance"))}</div></div>
+                    </div>
                 </div>
 
                 <div class="card">
