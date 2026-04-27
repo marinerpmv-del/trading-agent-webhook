@@ -1,427 +1,78 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from datetime import datetime, timezone
-from pybit.unified_trading import HTTP
-from openai import OpenAI
-import os
-import json
-import html
-import time
-from typing import Optional
-
-app = FastAPI()
-
-signals_log = []
-
-# AI cache and decision log.
-ai_brief_cache = {}
-
-# Simple in-memory decision log.
-# Important: this resets after Render restart/redeploy.
-ai_decision_log = []
-MAX_AI_DECISION_LOG_ITEMS = 100
-
-# Public Bybit connection. No API key needed for market data.
-bybit = HTTP(testnet=False)
-
-# OpenAI client.
-# The key must be stored in Render Environment Variables as OPENAI_API_KEY.
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-# Cache AI brief to avoid spending money every dashboard refresh.
-AI_CACHE_TTL_SECONDS = int(os.getenv("AI_CACHE_TTL_SECONDS", "600"))
-
-# UI defaults for dashboard/chart selectors.
-DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "APTUSDT"]
-INTERVAL_OPTIONS = [
-    ("1", "1m"),
-    ("5", "5m"),
-    ("15", "15m"),
-    ("30", "30m"),
-    ("60", "1H"),
-    ("120", "2H"),
-    ("240", "4H"),
-    ("D", "1D"),
-    ("W", "1W"),
-]
-
-
-def interval_label(interval):
-    for value, label in INTERVAL_OPTIONS:
-        if str(interval) == value:
-            return label
-    return str(interval)
-
-
-def interval_select_html(selected_interval):
-    selected_interval = str(selected_interval)
-    options = []
-    for value, label in INTERVAL_OPTIONS:
-        selected = " selected" if value == selected_interval else ""
-        options.append(f'<option value="{html.escape(value)}"{selected}>{html.escape(label)}</option>')
-    return "".join(options)
-
-
-def symbol_datalist_html():
-    return "".join(f'<option value="{html.escape(sym)}">' for sym in DEFAULT_SYMBOLS)
-
-
-# =====================================================
-# BASIC HELPERS
-# =====================================================
-
-def sma(values, length):
-    if len(values) < length:
-        return None
-    return sum(values[-length:]) / length
-
-
-def ema(values, length):
-    if len(values) < length:
-        return None
-
-    k = 2 / (length + 1)
-    ema_value = sum(values[:length]) / length
-
-    for price in values[length:]:
-        ema_value = price * k + ema_value * (1 - k)
-
-    return ema_value
-
-
-def ema_series(values, length):
-    """
-    Returns a list the same length as values.
-    Values before enough data are None.
-    """
-    if len(values) < length:
-        return [None for _ in values]
-
-    result = [None for _ in values]
-    k = 2 / (length + 1)
-    ema_value = sum(values[:length]) / length
-    result[length - 1] = ema_value
-
-    for i in range(length, len(values)):
-        ema_value = values[i] * k + ema_value * (1 - k)
-        result[i] = ema_value
-
-    return result
-
-
-def rsi(values, length=14):
-    if len(values) <= length:
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(abs(min(change, 0)))
-
-    avg_gain = sum(gains[-length:]) / length
-    avg_loss = sum(losses[-length:]) / length
-
-    if avg_loss == 0:
-        return 100
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def atr(candles, length=14):
-    if len(candles) <= length:
-        return None
-
-    true_ranges = []
-
-    for i in range(1, len(candles)):
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-        prev_close = candles[i - 1]["close"]
-
-        tr = max(
-            high - low,
-            abs(high - prev_close),
-            abs(low - prev_close),
-        )
-        true_ranges.append(tr)
-
-    return sum(true_ranges[-length:]) / length
-
-
-def fmt_number(value, decimals=2):
-    if value is None:
-        return "-"
-    try:
-        return f"{value:,.{decimals}f}"
-    except Exception:
-        return "-"
-
-
-def get_bybit_candles(symbol="BTCUSDT", interval="60", limit=200):
-    response = bybit.get_kline(
-        category="linear",
-        symbol=symbol,
-        interval=interval,
-        limit=limit,
-    )
-
-    raw_candles = response.get("result", {}).get("list", [])
-    raw_candles = list(reversed(raw_candles))
-
-    candles = []
-    for c in raw_candles:
-        candles.append({
-            "start_time": int(c[0]),
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4]),
-            "volume": float(c[5]),
-            "turnover": float(c[6]),
-        })
-
-    return candles
-
-
-# =====================================================
-# SMART MONEY CONCEPT HELPERS
-# =====================================================
-
-def find_swing_highs_lows(candles, left=3, right=3):
-    swing_highs = []
-    swing_lows = []
-
-    for i in range(left, len(candles) - right):
-        current_high = candles[i]["high"]
-        current_low = candles[i]["low"]
-
-        is_high = True
-        is_low = True
-
-        for j in range(i - left, i + right + 1):
-            if j == i:
-                continue
-
-            if candles[j]["high"] >= current_high:
-                is_high = False
-
-            if candles[j]["low"] <= current_low:
-                is_low = False
-
-        if is_high:
-            swing_highs.append({
-                "index": i,
-                "price": current_high,
-                "time": candles[i]["start_time"],
-            })
-
-        if is_low:
-            swing_lows.append({
-                "index": i,
-                "price": current_low,
-                "time": candles[i]["start_time"],
-            })
-
-    return swing_highs, swing_lows
-
-
-def detect_liquidity_sweep(candles, swing_highs, swing_lows):
-    last = candles[-1]
-    close = last["close"]
-    high = last["high"]
-    low = last["low"]
-
-    recent_high = swing_highs[-1]["price"] if swing_highs else None
-    recent_low = swing_lows[-1]["price"] if swing_lows else None
-
-    high_sweep = False
-    low_sweep = False
-
-    if recent_high is not None:
-        high_sweep = high > recent_high and close < recent_high
-
-    if recent_low is not None:
-        low_sweep = low < recent_low and close > recent_low
-
-    return {
-        "recent_high": recent_high,
-        "recent_low": recent_low,
-        "high_sweep": high_sweep,
-        "low_sweep": low_sweep,
-    }
-
-
-def detect_market_structure(candles, swing_highs, swing_lows):
-    close = candles[-1]["close"]
-
-    last_high = swing_highs[-1]["price"] if swing_highs else None
-    last_low = swing_lows[-1]["price"] if swing_lows else None
-
-    prev_high = swing_highs[-2]["price"] if len(swing_highs) >= 2 else None
-    prev_low = swing_lows[-2]["price"] if len(swing_lows) >= 2 else None
-
-    bos_bullish = last_high is not None and close > last_high
-    bos_bearish = last_low is not None and close < last_low
-
-    structure = "NEUTRAL"
-
-    if last_high is not None and prev_high is not None and last_low is not None and prev_low is not None:
-        if last_high > prev_high and last_low > prev_low:
-            structure = "BULLISH"
-        elif last_high < prev_high and last_low < prev_low:
-            structure = "BEARISH"
-        else:
-            structure = "MIXED / TRANSITION"
-
-    return {
-        "structure": structure,
-        "last_swing_high": last_high,
-        "last_swing_low": last_low,
-        "bos_bullish": bos_bullish,
-        "bos_bearish": bos_bearish,
-    }
-
-
-def detect_fvg(candles):
-    bullish_fvgs = []
-    bearish_fvgs = []
-
-    for i in range(2, len(candles)):
-        c1 = candles[i - 2]
-        c3 = candles[i]
-
-        # Bullish imbalance: current low is above candle-2 high.
-        if c3["low"] > c1["high"]:
-            bullish_fvgs.append({
-                "index": i,
-                "low": c1["high"],
-                "high": c3["low"],
-                "mid": (c1["high"] + c3["low"]) / 2,
-            })
-
-        # Bearish imbalance: current high is below candle-2 low.
-        if c3["high"] < c1["low"]:
-            bearish_fvgs.append({
-                "index": i,
-                "low": c3["high"],
-                "high": c1["low"],
-                "mid": (c3["high"] + c1["low"]) / 2,
-            })
-
-    price = candles[-1]["close"]
-
-    last_bullish_fvg = bullish_fvgs[-1] if bullish_fvgs else None
-    last_bearish_fvg = bearish_fvgs[-1] if bearish_fvgs else None
-
-    inside_bullish_fvg = False
-    inside_bearish_fvg = False
-
-    if last_bullish_fvg:
-        inside_bullish_fvg = last_bullish_fvg["low"] <= price <= last_bullish_fvg["high"]
-
-    if last_bearish_fvg:
-        inside_bearish_fvg = last_bearish_fvg["low"] <= price <= last_bearish_fvg["high"]
-
-    return {
-        "bullish_fvg_active": last_bullish_fvg is not None,
-        "bearish_fvg_active": last_bearish_fvg is not None,
-        "inside_bullish_fvg": inside_bullish_fvg,
-        "inside_bearish_fvg": inside_bearish_fvg,
-        "last_bullish_fvg": last_bullish_fvg,
-        "last_bearish_fvg": last_bearish_fvg,
-    }
-
-
-def detect_order_blocks(candles, lookback=40):
-    price = candles[-1]["close"]
-
-    bullish_ob = None
-    bearish_ob = None
-
-    recent = candles[-lookback:]
-
-    for i in range(2, len(recent)):
-        prev = recent[i - 1]
-        curr = recent[i]
-
-        # Bullish OB approximation:
-        # last bearish candle before strong bullish displacement.
-        if prev["close"] < prev["open"] and curr["close"] > curr["open"]:
-            body = abs(curr["close"] - curr["open"])
-            candle_range = curr["high"] - curr["low"]
-
-            if candle_range > 0 and body / candle_range > 0.55 and curr["close"] > prev["high"]:
-                bullish_ob = {
-                    "low": prev["low"],
-                    "high": prev["high"],
-                    "mid": (prev["low"] + prev["high"]) / 2,
-                }
-
-        # Bearish OB approximation:
-        # last bullish candle before strong bearish displacement.
-        if prev["close"] > prev["open"] and curr["close"] < curr["open"]:
-            body = abs(curr["close"] - curr["open"])
-            candle_range = curr["high"] - curr["low"]
-
-            if candle_range > 0 and body / candle_range > 0.55 and curr["close"] < prev["low"]:
-                bearish_ob = {
-                    "low": prev["low"],
-                    "high": prev["high"],
-                    "mid": (prev["low"] + prev["high"]) / 2,
-                }
-
-    inside_bullish_ob = False
-    inside_bearish_ob = False
-
-    if bullish_ob:
-        inside_bullish_ob = bullish_ob["low"] <= price <= bullish_ob["high"]
-
-    if bearish_ob:
-        inside_bearish_ob = bearish_ob["low"] <= price <= bearish_ob["high"]
-
-    return {
-        "bullish_ob_active": bullish_ob is not None,
-        "bearish_ob_active": bearish_ob is not None,
-        "inside_bullish_ob": inside_bullish_ob,
-        "inside_bearish_ob": inside_bearish_ob,
-        "bullish_ob": bullish_ob,
-        "bearish_ob": bearish_ob,
-    }
-
-
-def detect_premium_discount(candles, lookback=100):
-    recent = candles[-lookback:]
-
-    range_high = max(c["high"] for c in recent)
-    range_low = min(c["low"] for c in recent)
-    equilibrium = (range_high + range_low) / 2
-    price = candles[-1]["close"]
-
-    if price < equilibrium:
-        zone = "DISCOUNT"
-    elif price > equilibrium:
-        zone = "PREMIUM"
-    else:
-        zone = "EQUILIBRIUM"
-
-    return {
-        "range_high": range_high,
-        "range_low": range_low,
-        "equilibrium": equilibrium,
-        "pd_zone": zone,
-    }
-
+TRADING AGENT CODE UPDATE — EARLY / CONFIRMED SIGNAL LOGIC
+==============================================================
+
+Repository:
+https://github.com/marinerpmv-del/trading-agent-webhook
+
+Main file:
+https://github.com/marinerpmv-del/trading-agent-webhook/blob/main/main.py
+
+Goal:
+Fix the current issue where the agent shows SMC = 0 and Tech = 0 during NEUTRAL / CHOP conditions and therefore misses early bounce/reversal entries.
+
+The new logic allows:
+- WATCH LONG
+- WATCH SHORT
+- EARLY LONG
+- EARLY SHORT
+- CONFIRMED LONG
+- CONFIRMED SHORT
+- NO TRADE
+- DO NOT CHASE
+
+It also adds:
+- directional LONG and SHORT scoring
+- early bounce/reversal detection
+- blocked_by / missing confirmation explanations
+- long_total / short_total comparison
+
+
+==============================================================
+1. REPLACE calculate_smc_score()
+==============================================================
+
+Find this function in main.py:
 
 def calculate_smc_score(bias, liquidity, structure, fvg, ob, pd):
+
+Replace the full old function with this:
+
+
+def calculate_smc_score(bias, liquidity, structure, fvg, ob, pd, candles=None, atr14=None, ema50=None, ema200=None):
+    """
+    Directional SMC score.
+    Important change:
+    This function can score LONG and SHORT even when the general EMA trend is neutral/choppy.
+    That allows the agent to detect early bounce/reversal setups.
+    """
+
     score = 0
     notes = []
+
+    current_price = candles[-1]["close"] if candles else None
+    last_candle = candles[-1] if candles else None
+    prev_candle = candles[-2] if candles and len(candles) >= 2 else None
+
+    bullish_reaction = False
+    bearish_reaction = False
+
+    if last_candle and prev_candle:
+        bullish_reaction = (
+            last_candle["close"] > last_candle["open"]
+            and last_candle["close"] > prev_candle["close"]
+        )
+
+        bearish_reaction = (
+            last_candle["close"] < last_candle["open"]
+            and last_candle["close"] < prev_candle["close"]
+        )
+
+    near_ema200_long = False
+    near_ema200_short = False
+
+    if current_price is not None and ema200 is not None and atr14 is not None and atr14 > 0:
+        near_ema200_long = abs(current_price - ema200) <= atr14 * 0.8 and current_price >= ema200
+        near_ema200_short = abs(current_price - ema200) <= atr14 * 0.8 and current_price <= ema200
 
     if bias == "LONG":
         if liquidity["low_sweep"]:
@@ -435,18 +86,29 @@ def calculate_smc_score(bias, liquidity, structure, fvg, ob, pd):
         if structure["structure"] == "BULLISH":
             score += 8
             notes.append("Market structure is bullish")
+        elif structure["structure"] == "MIXED / TRANSITION":
+            score += 4
+            notes.append("Market structure is mixed but may be transitioning")
 
         if fvg["inside_bullish_fvg"]:
             score += 8
-            notes.append("Price is inside bullish FVG")
+            notes.append("Price is reacting inside bullish FVG")
 
         if ob["inside_bullish_ob"]:
             score += 8
-            notes.append("Price is inside bullish order block")
+            notes.append("Price is reacting inside bullish order block")
 
         if pd["pd_zone"] == "DISCOUNT":
             score += 10
             notes.append("Price is in discount zone")
+
+        if bullish_reaction:
+            score += 5
+            notes.append("Bullish reaction candle detected")
+
+        if near_ema200_long:
+            score += 5
+            notes.append("Price is holding near/above EMA200 support")
 
     elif bias == "SHORT":
         if liquidity["high_sweep"]:
@@ -460,18 +122,29 @@ def calculate_smc_score(bias, liquidity, structure, fvg, ob, pd):
         if structure["structure"] == "BEARISH":
             score += 8
             notes.append("Market structure is bearish")
+        elif structure["structure"] == "MIXED / TRANSITION":
+            score += 4
+            notes.append("Market structure is mixed but may be transitioning")
 
         if fvg["inside_bearish_fvg"]:
             score += 8
-            notes.append("Price is inside bearish FVG")
+            notes.append("Price is reacting inside bearish FVG")
 
         if ob["inside_bearish_ob"]:
             score += 8
-            notes.append("Price is inside bearish order block")
+            notes.append("Price is reacting inside bearish order block")
 
         if pd["pd_zone"] == "PREMIUM":
             score += 10
             notes.append("Price is in premium zone")
+
+        if bearish_reaction:
+            score += 5
+            notes.append("Bearish reaction candle detected")
+
+        if near_ema200_short:
+            score += 5
+            notes.append("Price is rejecting near/below EMA200 resistance")
 
     return {
         "smc_score": min(score, 50),
@@ -479,313 +152,130 @@ def calculate_smc_score(bias, liquidity, structure, fvg, ob, pd):
     }
 
 
-# =====================================================
-# AI MARKET BRIEF
-# =====================================================
+==============================================================
+2. ADD calculate_technical_score()
+==============================================================
 
-def compact_market_data_for_ai(data):
+Insert this function immediately after calculate_smc_score():
+
+
+def calculate_technical_score(bias, current_price, ema50, ema200, rsi14, extended, volume_strong):
+    """
+    Directional technical score.
+    This allows LONG/SHORT scoring even if the market is not in a perfect EMA trend.
+    """
+
+    score = 0
+    notes = []
+
+    if bias == "LONG":
+        if current_price > ema200:
+            score += 8
+            notes.append("Price is above EMA200")
+
+        if ema50 > ema200:
+            score += 7
+            notes.append("EMA50 is above EMA200")
+
+        if current_price > ema50:
+            score += 6
+            notes.append("Price is above EMA50")
+        elif current_price > ema200:
+            score += 3
+            notes.append("Price is below EMA50 but still above EMA200")
+
+        if 40 <= rsi14 <= 68:
+            score += 8
+            notes.append("RSI is in acceptable long range")
+        elif 35 <= rsi14 < 40:
+            score += 4
+            notes.append("RSI is weak but recovering")
+
+        if not extended:
+            score += 4
+            notes.append("Price is not overextended from EMA50")
+
+        if volume_strong:
+            score += 2
+            notes.append("Volume is stronger than average")
+
+    elif bias == "SHORT":
+        if current_price < ema200:
+            score += 8
+            notes.append("Price is below EMA200")
+
+        if ema50 < ema200:
+            score += 7
+            notes.append("EMA50 is below EMA200")
+
+        if current_price < ema50:
+            score += 6
+            notes.append("Price is below EMA50")
+        elif current_price < ema200:
+            score += 3
+            notes.append("Price is above EMA50 but still below EMA200")
+
+        if 32 <= rsi14 <= 60:
+            score += 8
+            notes.append("RSI is in acceptable short range")
+        elif 60 < rsi14 <= 66:
+            score += 4
+            notes.append("RSI is high but may be rolling over")
+
+        if not extended:
+            score += 4
+            notes.append("Price is not overextended from EMA50")
+
+        if volume_strong:
+            score += 2
+            notes.append("Volume is stronger than average")
+
     return {
-        "symbol": data.get("symbol"),
-        "timeframe": data.get("interval"),
-        "price": round(data.get("price", 0), 2),
-        "decision": data.get("decision"),
-        "action": data.get("action"),
-        "reason": data.get("reason"),
-        "trend": data.get("trend"),
-        "bias": data.get("bias"),
-        "extended_from_ema50": data.get("extended"),
-        "ema50": round(data.get("ema50", 0), 2),
-        "ema200": round(data.get("ema200", 0), 2),
-        "rsi14": round(data.get("rsi14", 0), 2),
-        "atr14": round(data.get("atr14", 0), 2),
-        "distance_from_ema50_atr": round(data.get("distance_from_ema50_atr", 0), 2),
-        "distance_from_ema50_pct": round(data.get("distance_from_ema50_pct", 0), 2),
-        "volume_strong": data.get("volume_strong"),
-        "market_structure": data.get("market_structure"),
-        "pd_zone": data.get("pd_zone"),
-        "bos_bullish": data.get("bos_bullish"),
-        "bos_bearish": data.get("bos_bearish"),
-        "low_sweep": data.get("low_sweep"),
-        "high_sweep": data.get("high_sweep"),
-        "inside_bullish_fvg": data.get("inside_bullish_fvg"),
-        "inside_bearish_fvg": data.get("inside_bearish_fvg"),
-        "inside_bullish_ob": data.get("inside_bullish_ob"),
-        "inside_bearish_ob": data.get("inside_bearish_ob"),
-        "smc_score": data.get("smc_score"),
-        "technical_score": data.get("technical_score"),
-        "risk_score": data.get("risk_score"),
-        "total_score": data.get("total_score"),
-        "entry": data.get("entry"),
-        "stop_loss": data.get("stop_loss"),
-        "tp1": data.get("tp1"),
-        "tp2": data.get("tp2"),
-        "tp3": data.get("tp3"),
-        "suggested_position": data.get("suggested_position"),
-        "suggested_leverage": data.get("suggested_leverage"),
+        "technical_score": min(score, 35),
+        "technical_notes": notes,
     }
 
 
-def generate_ai_market_brief(data):
-    cache_key = f"{data.get('symbol')}:{data.get('interval')}:{data.get('decision')}:{data.get('total_score')}:{data.get('smc_score')}"
-    now = time.time()
+==============================================================
+3. REPLACE THE MAIN SCORING / DECISION BLOCK INSIDE analyze_market()
+==============================================================
 
-    cached = ai_brief_cache.get(cache_key)
-    if cached and now - cached["created_at"] < AI_CACHE_TTL_SECONDS:
-        return {
-            "status": "cached",
-            "brief": cached["brief"],
-            "updated_at": cached["updated_at"],
-            "model": cached["model"],
-        }
-
-    if not openai_client:
-        return {
-            "status": "disabled",
-            "brief": (
-                "AI Market Brief is not available because OPENAI_API_KEY is not configured. "
-                "Check Render Environment Variables."
-            ),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "model": None,
-        }
-
-    market_data = compact_market_data_for_ai(data)
-
-    system_prompt = """
-You are a cautious crypto trading analysis assistant.
-
-You do NOT give financial advice.
-You do NOT guarantee profits.
-You do NOT encourage high leverage.
-You analyze only the provided structured market data.
-
-Your job:
-1. Explain the current market situation clearly.
-2. Identify whether the setup is actionable or should be watched.
-3. Explain what confirmation is missing.
-4. Describe what to wait for.
-5. Define invalidation.
-6. Give a risk warning.
-
-Use concise trader language.
-Be skeptical.
-Do not overhype the setup.
-If SMC confirmation is weak, say it clearly.
-If the agent says WAIT, do not turn it into an entry signal.
-
-Return the answer in this exact format:
-
-Market Scenario:
-...
-
-Entry Quality:
-...
-
-What To Wait For:
-...
-
-Invalidation:
-...
-
-Risk Warning:
-...
-"""
-
-    user_prompt = f"""
-Analyze this trading-agent output.
-
-Market data JSON:
-{json.dumps(market_data, indent=2)}
-
-Important rules:
-- If decision is LONG BIAS or SHORT BIAS, treat it as watch-only, not an entry.
-- If SMC score is below 30/50, say SMC confirmation is not strong enough for a smart signal.
-- If decision is SMART LONG or SMART SHORT, still mention that the trade requires risk control and confirmation.
-- Keep it practical and concise.
-"""
-
-    try:
-        response = openai_client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ],
-            max_output_tokens=700,
-        )
-
-        brief = response.output_text.strip()
-
-        result = {
-            "status": "ok",
-            "brief": brief,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "model": OPENAI_MODEL,
-        }
-
-        ai_brief_cache[cache_key] = {
-            "brief": brief,
-            "created_at": now,
-            "updated_at": result["updated_at"],
-            "model": OPENAI_MODEL,
-        }
-
-        return result
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "brief": f"AI Market Brief error: {str(e)}",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "model": OPENAI_MODEL,
-        }
-
-
-def log_ai_decision(data, ai_brief):
-    """
-    Store a compact AI decision log item.
-    This is in-memory only. It resets after Render restart/redeploy.
-    """
-
-    brief_text = ai_brief.get("brief", "") if ai_brief else ""
-    brief_preview = brief_text[:700]
-
-    log_key = (
-        f"{data.get('symbol')}:"
-        f"{data.get('interval')}:"
-        f"{data.get('decision')}:"
-        f"{round(data.get('price', 0), 1)}:"
-        f"{data.get('total_score')}:"
-        f"{data.get('smc_score')}:"
-        f"{data.get('action')}"
-    )
-
-    # Avoid duplicate entries caused by dashboard auto-refresh.
-    if ai_decision_log and ai_decision_log[-1].get("log_key") == log_key:
-        return ai_decision_log[-1]
-
-    item = {
-        "log_key": log_key,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "symbol": data.get("symbol"),
-        "interval": data.get("interval"),
-        "price": data.get("price"),
-        "decision": data.get("decision"),
-        "action": data.get("action"),
-        "trend": data.get("trend"),
-        "bias": data.get("bias"),
-        "smc_score": data.get("smc_score"),
-        "technical_score": data.get("technical_score"),
-        "risk_score": data.get("risk_score"),
-        "total_score": data.get("total_score"),
-        "market_structure": data.get("market_structure"),
-        "pd_zone": data.get("pd_zone"),
-        "low_sweep": data.get("low_sweep"),
-        "high_sweep": data.get("high_sweep"),
-        "inside_bullish_fvg": data.get("inside_bullish_fvg"),
-        "inside_bearish_fvg": data.get("inside_bearish_fvg"),
-        "inside_bullish_ob": data.get("inside_bullish_ob"),
-        "inside_bearish_ob": data.get("inside_bearish_ob"),
-        "entry": data.get("entry"),
-        "stop_loss": data.get("stop_loss"),
-        "tp1": data.get("tp1"),
-        "tp2": data.get("tp2"),
-        "tp3": data.get("tp3"),
-        "ai_status": ai_brief.get("status") if ai_brief else None,
-        "ai_model": ai_brief.get("model") if ai_brief else None,
-        "ai_updated_at": ai_brief.get("updated_at") if ai_brief else None,
-        "ai_brief_preview": brief_preview,
-    }
-
-    ai_decision_log.append(item)
-
-    if len(ai_decision_log) > MAX_AI_DECISION_LOG_ITEMS:
-        del ai_decision_log[0:len(ai_decision_log) - MAX_AI_DECISION_LOG_ITEMS]
-
-    return item
-
-
-# =====================================================
-# MAIN ANALYSIS ENGINE
-# =====================================================
-
-def analyze_market(symbol="BTCUSDT", interval="60"):
-    candles = get_bybit_candles(symbol=symbol, interval=interval, limit=250)
-
-    closes = [c["close"] for c in candles]
-    volumes = [c["volume"] for c in candles]
-
-    current_price = closes[-1]
-
-    ema50 = ema(closes, 50)
-    ema200 = ema(closes, 200)
-    rsi14 = rsi(closes, 14)
-    atr14 = atr(candles, 14)
-    volume_sma20 = sma(volumes, 20)
-
-    if ema50 is None or ema200 is None or rsi14 is None or atr14 is None or volume_sma20 is None:
-        return {
-            "status": "error",
-            "message": "Not enough data for analysis",
-        }
-
-    distance_from_ema50_atr = abs(current_price - ema50) / atr14
-    distance_from_ema50_pct = abs(current_price - ema50) / current_price * 100
-
-    bullish_trend = current_price > ema50 > ema200
-    bearish_trend = current_price < ema50 < ema200
-
-    extended = distance_from_ema50_atr > 1.2
-    volume_strong = volumes[-1] > volume_sma20
-
-    if bullish_trend:
-        trend = "BULLISH"
-        bias = "LONG"
-    elif bearish_trend:
-        trend = "BEARISH"
-        bias = "SHORT"
-    else:
-        trend = "NEUTRAL / CHOP"
-        bias = "NONE"
-
-    # SMC analysis
-    swing_highs, swing_lows = find_swing_highs_lows(candles)
-    liquidity = detect_liquidity_sweep(candles, swing_highs, swing_lows)
-    structure = detect_market_structure(candles, swing_highs, swing_lows)
-    fvg = detect_fvg(candles)
-    ob = detect_order_blocks(candles)
-    pd = detect_premium_discount(candles)
+Inside analyze_market(), find this line:
 
     smc = calculate_smc_score(bias, liquidity, structure, fvg, ob, pd)
 
-    # Technical score: max 35
-    technical_score = 0
+Then select everything from that line down to just BEFORE:
 
-    if bias == "LONG":
-        if bullish_trend:
-            technical_score += 15
-        if 45 <= rsi14 <= 72:
-            technical_score += 8
-        if not extended:
-            technical_score += 7
-        if volume_strong:
-            technical_score += 5
+    return {
+        "status": "ok",
 
-    elif bias == "SHORT":
-        if bearish_trend:
-            technical_score += 15
-        if 28 <= rsi14 <= 55:
-            technical_score += 8
-        if not extended:
-            technical_score += 7
-        if volume_strong:
-            technical_score += 5
+Replace that whole block with this:
+
+
+    # =====================================================
+    # Directional scoring
+    # =====================================================
+    # Important:
+    # We score LONG and SHORT separately.
+    # This fixes the old problem where NEUTRAL / CHOP caused SMC = 0 and Tech = 0.
+
+    smc_long = calculate_smc_score(
+        "LONG", liquidity, structure, fvg, ob, pd,
+        candles=candles, atr14=atr14, ema50=ema50, ema200=ema200
+    )
+
+    smc_short = calculate_smc_score(
+        "SHORT", liquidity, structure, fvg, ob, pd,
+        candles=candles, atr14=atr14, ema50=ema50, ema200=ema200
+    )
+
+    tech_long = calculate_technical_score(
+        "LONG", current_price, ema50, ema200, rsi14, extended, volume_strong
+    )
+
+    tech_short = calculate_technical_score(
+        "SHORT", current_price, ema50, ema200, rsi14, extended, volume_strong
+    )
 
     # Risk score: max 15
     risk_score = 0
@@ -800,24 +290,91 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         else:
             risk_score = 3
 
-    total_score = smc["smc_score"] + technical_score + risk_score
+    long_total = smc_long["smc_score"] + tech_long["technical_score"] + risk_score
+    short_total = smc_short["smc_score"] + tech_short["technical_score"] + risk_score
 
+    # Choose best directional setup.
+    # In clean EMA trend we respect trend direction more.
+    # In chop/neutral we still allow early bounce/reversal setups if SMC is meaningful.
+
+    selected_direction = "NONE"
+
+    if bullish_trend:
+        selected_direction = "LONG"
+    elif bearish_trend:
+        selected_direction = "SHORT"
+    else:
+        if long_total > short_total and smc_long["smc_score"] >= 15:
+            selected_direction = "LONG"
+        elif short_total > long_total and smc_short["smc_score"] >= 15:
+            selected_direction = "SHORT"
+        else:
+            selected_direction = "NONE"
+
+    if selected_direction == "LONG":
+        bias = "LONG"
+        smc = smc_long
+        technical = tech_long
+        total_score = long_total
+    elif selected_direction == "SHORT":
+        bias = "SHORT"
+        smc = smc_short
+        technical = tech_short
+        total_score = short_total
+    else:
+        bias = "NONE"
+        smc = {
+            "smc_score": max(smc_long["smc_score"], smc_short["smc_score"]),
+            "smc_notes": []
+        }
+        technical = {
+            "technical_score": max(tech_long["technical_score"], tech_short["technical_score"]),
+            "technical_notes": []
+        }
+        total_score = smc["smc_score"] + technical["technical_score"] + risk_score
+
+    technical_score = technical["technical_score"]
+    technical_notes = technical["technical_notes"]
+
+    # =====================================================
     # Entry / SL / TP estimate
+    # =====================================================
+
     if bias == "LONG":
         entry = current_price
-        stop_loss = current_price - atr14 * 1.5
-        tp1 = current_price + atr14 * 1.5
-        tp2 = current_price + atr14 * 2.5
-        tp3 = current_price + atr14 * 4.0
+
+        # Prefer structural stop below recent swing low if available.
+        if liquidity["recent_low"]:
+            structural_sl = liquidity["recent_low"] - atr14 * 0.25
+            atr_sl = current_price - atr14 * 1.5
+            stop_loss = min(atr_sl, structural_sl)
+        else:
+            stop_loss = current_price - atr14 * 1.5
+
+        risk_per_unit = current_price - stop_loss
+
+        tp1 = current_price + risk_per_unit * 1.0
+        tp2 = current_price + risk_per_unit * 1.8
+        tp3 = current_price + risk_per_unit * 2.8
         target = tp2
         potential_pct = (target - current_price) / current_price * 100
 
     elif bias == "SHORT":
         entry = current_price
-        stop_loss = current_price + atr14 * 1.5
-        tp1 = current_price - atr14 * 1.5
-        tp2 = current_price - atr14 * 2.5
-        tp3 = current_price - atr14 * 4.0
+
+        # Prefer structural stop above recent swing high if available.
+        if liquidity["recent_high"]:
+            structural_sl = liquidity["recent_high"] + atr14 * 0.25
+            atr_sl = current_price + atr14 * 1.5
+            stop_loss = max(atr_sl, structural_sl)
+        else:
+            stop_loss = current_price + atr14 * 1.5
+
+        risk_per_unit = stop_loss - current_price
+
+        tp1 = current_price - risk_per_unit * 1.0
+        tp2 = current_price - risk_per_unit * 1.8
+        tp3 = current_price - risk_per_unit * 2.8
         target = tp2
         potential_pct = (current_price - target) / current_price * 100
 
@@ -830,150 +387,188 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         target = None
         potential_pct = 0
 
-    # Decision logic
-    min_smc_for_smart_signal = 30
-    min_total_for_smart_signal = 75
+    # =====================================================
+    # Setup classification
+    # =====================================================
 
-    if trend == "NEUTRAL / CHOP":
-        decision = "NO TRADE"
-        action = "WAIT"
-        reason = "Market is not in a clean trend. Avoid trading in chop."
-        position = "$0"
-        leverage = "None"
+    min_smc_for_confirmed_signal = 30
+    min_total_for_confirmed_signal = 72
 
-    elif extended and smc["smc_score"] < min_smc_for_smart_signal:
-        decision = "DO NOT CHASE"
-        action = "WAIT FOR PULLBACK"
-        reason = "Trend exists, but price is extended from EMA50 and SMC confirmation is not strong enough."
+    min_smc_for_early_signal = 22
+    min_total_for_early_signal = 55
 
-        if bias == "LONG":
-            if pd["pd_zone"] == "PREMIUM":
-                reason += " Price is in premium zone; buying here is expensive."
-            reason += " Wait for pullback into discount, bullish OB/FVG, liquidity sweep, or bullish rejection."
+    blocked_by = []
 
-        elif bias == "SHORT":
-            if pd["pd_zone"] == "DISCOUNT":
-                reason += " Price is in discount zone; shorting here is late."
-            reason += " Wait for pullback into premium, bearish OB/FVG, liquidity sweep, or bearish rejection."
-
-        position = "$0"
-        leverage = "None"
-
-    elif bias == "LONG" and total_score >= min_total_for_smart_signal and smc["smc_score"] >= min_smc_for_smart_signal:
-        decision = "SMART LONG"
-        action = "PREPARE LONG"
-        reason = "Bullish trend with acceptable technical, risk, and SMC confirmation."
-
-        if smc["smc_notes"]:
-            reason += " " + "; ".join(smc["smc_notes"]) + "."
-
-        position = "Small test position only"
-        leverage = "Low / conservative"
-
-    elif bias == "SHORT" and total_score >= min_total_for_smart_signal and smc["smc_score"] >= min_smc_for_smart_signal:
-        decision = "SMART SHORT"
-        action = "PREPARE SHORT"
-        reason = "Bearish trend with acceptable technical, risk, and SMC confirmation."
-
-        if smc["smc_notes"]:
-            reason += " " + "; ".join(smc["smc_notes"]) + "."
-
-        position = "Small test position only"
-        leverage = "Low / conservative"
-
-    elif bias == "LONG" and total_score >= min_total_for_smart_signal and smc["smc_score"] < min_smc_for_smart_signal:
-        decision = "LONG BIAS"
-        action = "WAIT FOR SMC TRIGGER"
-        reason = (
-            "Bullish trend and risk conditions are good, but SMC confirmation is still not strong enough. "
-            "Do not chase. Wait for low sweep, bullish BOS, reaction from bullish FVG/OB, or pullback into discount."
+    long_early_trigger = (
+        bias == "LONG"
+        and (
+            liquidity["low_sweep"]
+            or fvg["inside_bullish_fvg"]
+            or ob["inside_bullish_ob"]
+            or pd["pd_zone"] == "DISCOUNT"
         )
-        position = "Not yet"
-        leverage = "Not yet"
+        and smc["smc_score"] >= min_smc_for_early_signal
+    )
 
-    elif bias == "SHORT" and total_score >= min_total_for_smart_signal and smc["smc_score"] < min_smc_for_smart_signal:
-        decision = "SHORT BIAS"
-        action = "WAIT FOR SMC TRIGGER"
-        reason = (
-            "Bearish trend and risk conditions are good, but SMC confirmation is still not strong enough. "
-            "Do not chase. Wait for high sweep, bearish BOS, reaction from bearish FVG/OB, or pullback into premium."
+    short_early_trigger = (
+        bias == "SHORT"
+        and (
+            liquidity["high_sweep"]
+            or fvg["inside_bearish_fvg"]
+            or ob["inside_bearish_ob"]
+            or pd["pd_zone"] == "PREMIUM"
         )
-        position = "Not yet"
-        leverage = "Not yet"
+        and smc["smc_score"] >= min_smc_for_early_signal
+    )
 
-    elif bias == "LONG":
-        decision = "LONG BIAS"
-        action = "WAIT FOR LONG TRIGGER"
-        reason = (
-            "Bullish trend detected, but full confirmation is not strong enough yet. "
-            "Wait for pullback, low sweep, bullish OB/FVG reaction, or better risk location."
+    long_confirmed_trigger = (
+        bias == "LONG"
+        and total_score >= min_total_for_confirmed_signal
+        and smc["smc_score"] >= min_smc_for_confirmed_signal
+        and (
+            structure["bos_bullish"]
+            or structure["structure"] == "BULLISH"
+            or liquidity["low_sweep"]
         )
-        position = "Not yet"
-        leverage = "Not yet"
+    )
+
+    short_confirmed_trigger = (
+        bias == "SHORT"
+        and total_score >= min_total_for_confirmed_signal
+        and smc["smc_score"] >= min_smc_for_confirmed_signal
+        and (
+            structure["bos_bearish"]
+            or structure["structure"] == "BEARISH"
+            or liquidity["high_sweep"]
+        )
+    )
+
+    # Build blocked_by explanations.
+    if bias == "LONG":
+        if smc["smc_score"] < min_smc_for_early_signal:
+            blocked_by.append("SMC score below early long threshold")
+        if current_price < ema200:
+            blocked_by.append("Price below EMA200")
+        if rsi14 < 38:
+            blocked_by.append("RSI still weak for long")
+        if extended and not liquidity["low_sweep"]:
+            blocked_by.append("Price extended without liquidity sweep")
+        if not volume_strong:
+            blocked_by.append("Volume is not strong")
 
     elif bias == "SHORT":
-        decision = "SHORT BIAS"
-        action = "WAIT FOR SHORT TRIGGER"
+        if smc["smc_score"] < min_smc_for_early_signal:
+            blocked_by.append("SMC score below early short threshold")
+        if current_price > ema200:
+            blocked_by.append("Price above EMA200")
+        if rsi14 > 62:
+            blocked_by.append("RSI still strong for short")
+        if extended and not liquidity["high_sweep"]:
+            blocked_by.append("Price extended without liquidity sweep")
+        if not volume_strong:
+            blocked_by.append("Volume is not strong")
+
+    else:
+        blocked_by.append("No directional setup selected")
+        blocked_by.append("Long and short scores are both weak or unclear")
+
+    # =====================================================
+    # Decision logic
+    # =====================================================
+
+    if long_confirmed_trigger:
+        decision = "CONFIRMED LONG"
+        action = "PREPARE LONG"
+        reason = "Confirmed long setup: SMC and technical conditions are aligned."
+        if smc["smc_notes"]:
+            reason += " " + "; ".join(smc["smc_notes"]) + "."
+        position = "Small controlled position"
+        leverage = "Low / conservative"
+
+    elif short_confirmed_trigger:
+        decision = "CONFIRMED SHORT"
+        action = "PREPARE SHORT"
+        reason = "Confirmed short setup: SMC and technical conditions are aligned."
+        if smc["smc_notes"]:
+            reason += " " + "; ".join(smc["smc_notes"]) + "."
+        position = "Small controlled position"
+        leverage = "Low / conservative"
+
+    elif long_early_trigger and total_score >= min_total_for_early_signal:
+        decision = "EARLY LONG"
+        action = "WATCH / ENTER SMALL ONLY"
         reason = (
-            "Bearish trend detected, but full confirmation is not strong enough yet. "
-            "Wait for pullback, high sweep, bearish OB/FVG reaction, or better risk location."
+            "Early long bounce setup detected. This is not fully confirmed yet, "
+            "but price is reacting from a potentially favorable SMC area."
+        )
+        if smc["smc_notes"]:
+            reason += " " + "; ".join(smc["smc_notes"]) + "."
+        if not structure["bos_bullish"]:
+            blocked_by.append("No bullish BOS confirmation yet")
+        position = "Tiny test position only"
+        leverage = "Very low / no leverage preferred"
+
+    elif short_early_trigger and total_score >= min_total_for_early_signal:
+        decision = "EARLY SHORT"
+        action = "WATCH / ENTER SMALL ONLY"
+        reason = (
+            "Early short rejection setup detected. This is not fully confirmed yet, "
+            "but price is reacting from a potentially favorable SMC area."
+        )
+        if smc["smc_notes"]:
+            reason += " " + "; ".join(smc["smc_notes"]) + "."
+        if not structure["bos_bearish"]:
+            blocked_by.append("No bearish BOS confirmation yet")
+        position = "Tiny test position only"
+        leverage = "Very low / no leverage preferred"
+
+    elif bias == "LONG" and smc["smc_score"] >= 15:
+        decision = "WATCH LONG"
+        action = "WAIT FOR LONG TRIGGER"
+        reason = (
+            "Long conditions are developing, but confirmation is incomplete. "
+            "Wait for reclaim, bullish BOS, stronger reaction candle, or volume confirmation."
         )
         position = "Not yet"
         leverage = "Not yet"
 
-    else:
-        decision = "WAIT"
-        action = "NO ACTION"
-        reason = "No clear setup."
+    elif bias == "SHORT" and smc["smc_score"] >= 15:
+        decision = "WATCH SHORT"
+        action = "WAIT FOR SHORT TRIGGER"
+        reason = (
+            "Short conditions are developing, but confirmation is incomplete. "
+            "Wait for rejection, bearish BOS, stronger reaction candle, or volume confirmation."
+        )
+        position = "Not yet"
+        leverage = "Not yet"
+
+    elif trend == "NEUTRAL / CHOP":
+        decision = "NO TRADE"
+        action = "WAIT"
+        reason = "Market is choppy and no useful early or confirmed setup is detected."
         position = "$0"
         leverage = "None"
 
-    return {
-        "status": "ok",
-        "symbol": symbol,
-        "interval": interval,
-        "price": current_price,
+    elif extended:
+        decision = "DO NOT CHASE"
+        action = "WAIT FOR PULLBACK"
+        reason = "Trend exists, but price is extended from EMA50. Wait for a better location."
+        position = "$0"
+        leverage = "None"
 
-        "ema50": ema50,
-        "ema200": ema200,
-        "rsi14": rsi14,
-        "atr14": atr14,
-        "volume": volumes[-1],
-        "volume_sma20": volume_sma20,
-        "volume_strong": volume_strong,
+    else:
+        decision = "NO TRADE"
+        action = "WAIT"
+        reason = "No clean actionable setup."
+        position = "$0"
+        leverage = "None"
 
-        "distance_from_ema50_atr": distance_from_ema50_atr,
-        "distance_from_ema50_pct": distance_from_ema50_pct,
 
-        "trend": trend,
-        "bias": bias,
-        "extended": extended,
+==============================================================
+4. UPDATE THE analyze_market() RETURN FIELDS
+==============================================================
 
-        "market_structure": structure["structure"],
-        "bos_bullish": structure["bos_bullish"],
-        "bos_bearish": structure["bos_bearish"],
-        "last_swing_high": structure["last_swing_high"],
-        "last_swing_low": structure["last_swing_low"],
-
-        "recent_high": liquidity["recent_high"],
-        "recent_low": liquidity["recent_low"],
-        "high_sweep": liquidity["high_sweep"],
-        "low_sweep": liquidity["low_sweep"],
-
-        "pd_zone": pd["pd_zone"],
-        "range_high": pd["range_high"],
-        "range_low": pd["range_low"],
-        "equilibrium": pd["equilibrium"],
-
-        "bullish_fvg_active": fvg["bullish_fvg_active"],
-        "bearish_fvg_active": fvg["bearish_fvg_active"],
-        "inside_bullish_fvg": fvg["inside_bullish_fvg"],
-        "inside_bearish_fvg": fvg["inside_bearish_fvg"],
-
-        "bullish_ob_active": ob["bullish_ob_active"],
-        "bearish_ob_active": ob["bearish_ob_active"],
-        "inside_bullish_ob": ob["inside_bullish_ob"],
-        "inside_bearish_ob": ob["inside_bearish_ob"],
+In the big return block of analyze_market(), find this part:
 
         "smc_score": smc["smc_score"],
         "smc_notes": smc["smc_notes"],
@@ -981,477 +576,45 @@ def analyze_market(symbol="BTCUSDT", interval="60"):
         "risk_score": risk_score,
         "total_score": total_score,
 
-        "decision": decision,
-        "action": action,
-        "reason": reason,
+Replace it with this:
 
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "target": target,
-        "potential_pct": potential_pct,
-
-        "suggested_position": position,
-        "suggested_leverage": leverage,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-# =====================================================
-# CHART DATA HELPERS
-# =====================================================
-
-def prepare_chart_payload(symbol="BTCUSDT", interval="60", limit=180):
-    candles = get_bybit_candles(symbol=symbol, interval=interval, limit=limit)
-    closes = [c["close"] for c in candles]
-
-    ema50_values = ema_series(closes, 50)
-    ema200_values = ema_series(closes, 200)
-
-    candle_data = []
-    ema50_data = []
-    ema200_data = []
-
-    for i, c in enumerate(candles):
-        # Bybit timestamp is in milliseconds. Lightweight Charts uses seconds.
-        t = int(c["start_time"] / 1000)
-
-        candle_data.append({
-            "time": t,
-            "open": c["open"],
-            "high": c["high"],
-            "low": c["low"],
-            "close": c["close"],
-        })
-
-        if ema50_values[i] is not None:
-            ema50_data.append({
-                "time": t,
-                "value": ema50_values[i],
-            })
-
-        if ema200_values[i] is not None:
-            ema200_data.append({
-                "time": t,
-                "value": ema200_values[i],
-            })
-
-    return {
-        "candles": candle_data,
-        "ema50": ema50_data,
-        "ema200": ema200_data,
-    }
+        "smc_score": smc["smc_score"],
+        "smc_notes": smc["smc_notes"],
+        "technical_score": technical_score,
+        "technical_notes": technical_notes,
+        "risk_score": risk_score,
+        "total_score": total_score,
+        "long_total": long_total,
+        "short_total": short_total,
+        "long_smc_score": smc_long["smc_score"],
+        "short_smc_score": smc_short["smc_score"],
+        "long_technical_score": tech_long["technical_score"],
+        "short_technical_score": tech_short["technical_score"],
+        "blocked_by": blocked_by,
 
 
-# =====================================================
-# ROUTES
-# =====================================================
+==============================================================
+5. ADD blocked_by DISPLAY TO dashboard()
+==============================================================
 
-@app.get("/")
-def home():
-    return {
-        "status": "online",
-        "message": "Trading agent webhook is running",
-        "signals_received": len(signals_log),
-        "bybit_public_data": "enabled",
-        "openai_key_configured": OPENAI_API_KEY is not None,
-        "ai_model": OPENAI_MODEL,
-        "dashboard": "/dashboard",
-        "chart": "/chart",
-        "decision_log": "/decision-log",
-    }
-
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.json()
-
-    signal = {
-        "received_at": datetime.now(timezone.utc).isoformat(),
-        "data": data,
-    }
-
-    signals_log.append(signal)
-
-    print("=== NEW SIGNAL ===")
-    print(signal)
-
-    return {
-        "status": "received",
-        "message": "Signal received successfully",
-        "signal": signal,
-    }
-
-
-@app.get("/signals")
-def get_signals():
-    return {
-        "count": len(signals_log),
-        "signals": signals_log[-20:],
-    }
-
-
-@app.get("/decision-log")
-def get_decision_log(limit: int = 50, symbol: Optional[str] = None, interval: Optional[str] = None):
-    limit = max(1, min(limit, 100))
-
-    items = ai_decision_log
-
-    if symbol:
-        symbol = symbol.upper()
-        items = [item for item in items if item.get("symbol") == symbol]
-
-    if interval:
-        interval = str(interval)
-        items = [item for item in items if str(item.get("interval")) == interval]
-
-    return {
-        "status": "ok",
-        "count": len(items),
-        "limit": limit,
-        "symbol": symbol,
-        "interval": interval,
-        "items": items[-limit:],
-    }
-
-
-@app.get("/bybit/ticker/{symbol}")
-def get_bybit_ticker(symbol: str = "BTCUSDT"):
-    symbol = symbol.upper()
-
-    response = bybit.get_tickers(
-        category="linear",
-        symbol=symbol,
-    )
-
-    return {
-        "status": "ok",
-        "symbol": symbol,
-        "source": "bybit",
-        "data": response,
-    }
-
-
-@app.get("/bybit/kline/{symbol}")
-def get_bybit_kline(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 50):
-    symbol = symbol.upper()
-    candles = get_bybit_candles(symbol=symbol, interval=interval, limit=limit)
-
-    return {
-        "status": "ok",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
-        "candles": candles,
-    }
-
-
-@app.get("/bybit/analyze/{symbol}")
-def get_analysis(symbol: str = "BTCUSDT", interval: str = "60", ai: bool = False):
-    symbol = symbol.upper()
-    data = analyze_market(symbol=symbol, interval=interval)
-
-    if ai and data.get("status") == "ok":
-        data["ai_market_brief"] = generate_ai_market_brief(data)
-        log_ai_decision(data, data["ai_market_brief"])
-
-    return data
-
-
-@app.get("/bybit/ai/{symbol}")
-def get_ai_analysis(symbol: str = "BTCUSDT", interval: str = "60"):
-    symbol = symbol.upper()
-    data = analyze_market(symbol=symbol, interval=interval)
-
-    if data.get("status") != "ok":
-        return data
-
-    ai_brief = generate_ai_market_brief(data)
-    log_ai_decision(data, ai_brief)
-
-    return {
-        "status": "ok",
-        "symbol": symbol,
-        "interval": interval,
-        "analysis": data,
-        "ai_market_brief": ai_brief,
-    }
-
-
-@app.get("/bybit/chart-data/{symbol}")
-def get_chart_data(symbol: str = "BTCUSDT", interval: str = "60", limit: int = 180):
-    symbol = symbol.upper()
-    limit = max(60, min(limit, 300))
-
-    analysis = analyze_market(symbol=symbol, interval=interval)
-    chart_data = prepare_chart_payload(symbol=symbol, interval=interval, limit=limit)
-
-    return {
-        "status": "ok",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
-        "analysis": analysis,
-        "chart": chart_data,
-    }
-
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
-    symbol = symbol.upper()
-    interval = str(interval)
-    data = analyze_market(symbol=symbol, interval=interval)
-
-    if data["status"] != "ok":
-        return f"""
-        <html>
-        <body>
-            <h1>Trading Agent Dashboard</h1>
-            <p>Error: {html.escape(str(data.get("message")))}</p>
-        </body>
-        </html>
-        """
-
-    ai_brief = generate_ai_market_brief(data)
-    log_ai_decision(data, ai_brief)
-
-    decision = data["decision"]
-
-    if decision == "DO NOT CHASE":
-        decision_color = "#7c3aed"
-    elif decision == "NO TRADE":
-        decision_color = "#6b7280"
-    elif decision == "SMART LONG":
-        decision_color = "#16a34a"
-    elif decision == "SMART SHORT":
-        decision_color = "#dc2626"
-    elif decision == "LONG BIAS":
-        decision_color = "#15803d"
-    elif decision == "SHORT BIAS":
-        decision_color = "#b91c1c"
-    else:
-        decision_color = "#2563eb"
-
-    def fmt(value, decimals=2):
-        return fmt_number(value, decimals)
-
-    def yes_no(value):
-        return "YES" if value else "NO"
-
-    def text_to_html(value):
-        safe = html.escape(value or "")
-        return safe.replace("\n", "<br>")
+Inside dashboard(), find:
 
     smc_notes_html = ""
 
-    if data["smc_notes"]:
-        smc_notes_html = "<ul>"
-        for note in data["smc_notes"]:
-            smc_notes_html += f"<li>{html.escape(note)}</li>"
-        smc_notes_html += "</ul>"
+Below the SMC notes block, add this:
+
+    blocked_by_html = ""
+
+    if data.get("blocked_by"):
+        blocked_by_html = "<ul>"
+        for item in data["blocked_by"]:
+            blocked_by_html += f"<li>{html.escape(str(item))}</li>"
+        blocked_by_html += "</ul>"
     else:
-        smc_notes_html = "<p>No strong SMC confirmation yet.</p>"
+        blocked_by_html = "<p>No major blockers.</p>"
 
-    ai_status = ai_brief.get("status")
-    ai_model = ai_brief.get("model") or "not configured"
-    ai_updated = ai_brief.get("updated_at")
-    ai_text = text_to_html(ai_brief.get("brief", ""))
 
-    interval_options_html = interval_select_html(data["interval"])
-    symbol_datalist = symbol_datalist_html()
-    interval_display = interval_label(data["interval"])
-
-    decision_log_rows = ""
-    filtered_log_items = [
-        item for item in ai_decision_log
-        if item.get("symbol") == data["symbol"] and str(item.get("interval")) == str(data["interval"])
-    ]
-    recent_log_items = list(reversed(filtered_log_items[-10:]))
-
-    if recent_log_items:
-        for item in recent_log_items:
-            decision_log_rows += f"""
-                <tr>
-                    <td>{html.escape(str(item.get("created_at", "-")))}</td>
-                    <td>{html.escape(str(item.get("symbol", "-")))}</td>
-                    <td>{html.escape(str(item.get("interval", "-")))}</td>
-                    <td>{fmt(item.get("price"))}</td>
-                    <td>{html.escape(str(item.get("decision", "-")))}</td>
-                    <td>{html.escape(str(item.get("action", "-")))}</td>
-                    <td>{html.escape(str(item.get("smc_score", "-")))}</td>
-                    <td>{html.escape(str(item.get("technical_score", "-")))}</td>
-                    <td>{html.escape(str(item.get("risk_score", "-")))}</td>
-                    <td>{html.escape(str(item.get("total_score", "-")))}</td>
-                </tr>
-            """
-    else:
-        decision_log_rows = """
-            <tr>
-                <td colspan="10">No AI decisions logged yet.</td>
-            </tr>
-        """
-
-    html_page = f"""
-    <html>
-    <head>
-        <title>Trading Agent Dashboard</title>
-        <meta http-equiv="refresh" content="30">
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background: #0f172a;
-                color: #e5e7eb;
-                padding: 24px;
-            }}
-            .container {{
-                max-width: 980px;
-                margin: auto;
-            }}
-            .card {{
-                background: #111827;
-                border: 1px solid #374151;
-                border-radius: 16px;
-                padding: 20px;
-                margin-bottom: 18px;
-                box-shadow: 0 10px 25px rgba(0,0,0,0.25);
-            }}
-            .decision {{
-                background: {decision_color};
-                color: white;
-                padding: 18px;
-                border-radius: 14px;
-                font-size: 28px;
-                font-weight: bold;
-                text-align: center;
-            }}
-            .grid {{
-                display: grid;
-                grid-template-columns: repeat(2, 1fr);
-                gap: 12px;
-            }}
-            .grid3 {{
-                display: grid;
-                grid-template-columns: repeat(3, 1fr);
-                gap: 12px;
-            }}
-            .item {{
-                background: #1f2937;
-                padding: 12px;
-                border-radius: 10px;
-            }}
-            .label {{
-                color: #9ca3af;
-                font-size: 13px;
-            }}
-            .value {{
-                font-size: 20px;
-                font-weight: bold;
-                margin-top: 4px;
-            }}
-            .reason {{
-                font-size: 18px;
-                line-height: 1.5;
-            }}
-            .score {{
-                font-size: 24px;
-                font-weight: bold;
-            }}
-            .ai {{
-                background: #0b1220;
-                border-left: 4px solid #38bdf8;
-                padding: 16px;
-                border-radius: 12px;
-                line-height: 1.65;
-                font-size: 16px;
-            }}
-            .small {{
-                color: #9ca3af;
-                font-size: 13px;
-            }}
-            a {{
-                color: #60a5fa;
-            }}
-            ul {{
-                line-height: 1.7;
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                font-size: 13px;
-            }}
-            th, td {{
-                border-bottom: 1px solid #374151;
-                padding: 8px;
-                text-align: left;
-                vertical-align: top;
-            }}
-            th {{
-                color: #93c5fd;
-                font-weight: bold;
-            }}
-            .controls {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 10px;
-                align-items: end;
-                margin-bottom: 18px;
-                background: #111827;
-                border: 1px solid #374151;
-                border-radius: 14px;
-                padding: 14px;
-            }}
-            .control-group {{
-                display: flex;
-                flex-direction: column;
-                gap: 5px;
-            }}
-            input, select, button {{
-                background: #020617;
-                color: #e5e7eb;
-                border: 1px solid #475569;
-                border-radius: 10px;
-                padding: 9px 11px;
-                font-size: 15px;
-            }}
-            button {{
-                background: #2563eb;
-                border-color: #2563eb;
-                cursor: pointer;
-                font-weight: bold;
-            }}
-            .top-links {{
-                margin-bottom: 18px;
-            }}
-            .top-links a {{
-                margin-right: 12px;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Trading Agent Dashboard</h1>
-
-            <form class="controls" method="get" action="/dashboard">
-                <div class="control-group">
-                    <label class="label" for="symbol">Symbol</label>
-                    <input id="symbol" name="symbol" list="symbols" value="{html.escape(data["symbol"])}" autocomplete="off">
-                    <datalist id="symbols">{symbol_datalist}</datalist>
-                </div>
-                <div class="control-group">
-                    <label class="label" for="interval">Timeframe</label>
-                    <select id="interval" name="interval">{interval_options_html}</select>
-                </div>
-                <button type="submit">Analyze</button>
-                <a href="/chart?symbol={html.escape(data["symbol"])}&interval={html.escape(data["interval"])}">Open Visual Chart</a>
-            </form>
-
-            <div class="top-links">
-                <a href="/chart?symbol={html.escape(data["symbol"])}&interval={html.escape(data["interval"])}">Open Visual Chart</a>
-                <a href="/decision-log?symbol={html.escape(data["symbol"])}&interval={html.escape(data["interval"])}">Open Decision Log JSON</a>
-                <a href="/bybit/analyze/{html.escape(data["symbol"])}?interval={html.escape(data["interval"])}&ai=true">Open Analysis JSON</a>
-            </div>
+Then find this card:
 
             <div class="card">
                 <div class="decision">{html.escape(data["decision"])}</div>
@@ -1459,561 +622,30 @@ def dashboard(symbol: str = "BTCUSDT", interval: str = "60"):
                 <p class="reason">{html.escape(data["reason"])}</p>
             </div>
 
-            <div class="card">
-                <h2>AI Market Brief</h2>
-                <div class="ai">{ai_text}</div>
-                <p class="small">AI status: {html.escape(str(ai_status))} | Model: {html.escape(str(ai_model))} | Updated UTC: {html.escape(str(ai_updated))}</p>
-            </div>
+Replace it with this:
 
             <div class="card">
-                <h2>AI Decision Log</h2>
-                <p class="small">Last 10 logged AI decisions for this symbol/timeframe. Full JSON: <a href="/decision-log?symbol={html.escape(data["symbol"])}&interval={html.escape(data["interval"])}">Open decision log</a></p>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>UTC Time</th>
-                            <th>Symbol</th>
-                            <th>TF</th>
-                            <th>Price</th>
-                            <th>Decision</th>
-                            <th>Action</th>
-                            <th>SMC</th>
-                            <th>Tech</th>
-                            <th>Risk</th>
-                            <th>Total</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {decision_log_rows}
-                    </tbody>
-                </table>
+                <div class="decision">{html.escape(data["decision"])}</div>
+                <h2>Action: {html.escape(data["action"])}</h2>
+                <p class="reason">{html.escape(data["reason"])}</p>
+                <h3>Blocked By / Missing Confirmation</h3>
+                {blocked_by_html}
             </div>
 
-            <div class="card">
-                <h2>Signal Quality Score</h2>
-                <div class="grid3">
-                    <div class="item">
-                        <div class="label">SMC Score</div>
-                        <div class="score">{data["smc_score"]} / 50</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Technical Score</div>
-                        <div class="score">{data["technical_score"]} / 35</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Risk Score</div>
-                        <div class="score">{data["risk_score"]} / 15</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Total Score</div>
-                        <div class="score">{data["total_score"]} / 100</div>
-                    </div>
-                </div>
-            </div>
 
-            <div class="card">
-                <h2>{html.escape(data["symbol"])} / Timeframe: {html.escape(interval_display)}</h2>
-                <div class="grid">
-                    <div class="item">
-                        <div class="label">Current Price</div>
-                        <div class="value">{fmt(data["price"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Trend</div>
-                        <div class="value">{html.escape(data["trend"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Bias</div>
-                        <div class="value">{html.escape(data["bias"])}</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Extended From EMA50</div>
-                        <div class="value">{yes_no(data["extended"])}</div>
-                    </div>
-                </div>
-            </div>
+==============================================================
+6. AFTER EDITING
+==============================================================
 
-            <div class="card">
-                <h2>Smart Money Concepts</h2>
-                <div class="grid">
-                    <div class="item"><div class="label">Market Structure</div><div class="value">{html.escape(data["market_structure"])}</div></div>
-                    <div class="item"><div class="label">PD Zone</div><div class="value">{html.escape(data["pd_zone"])}</div></div>
-                    <div class="item"><div class="label">Bullish BOS</div><div class="value">{yes_no(data["bos_bullish"])}</div></div>
-                    <div class="item"><div class="label">Bearish BOS</div><div class="value">{yes_no(data["bos_bearish"])}</div></div>
-                    <div class="item"><div class="label">Low Sweep</div><div class="value">{yes_no(data["low_sweep"])}</div></div>
-                    <div class="item"><div class="label">High Sweep</div><div class="value">{yes_no(data["high_sweep"])}</div></div>
-                    <div class="item"><div class="label">Inside Bullish FVG</div><div class="value">{yes_no(data["inside_bullish_fvg"])}</div></div>
-                    <div class="item"><div class="label">Inside Bearish FVG</div><div class="value">{yes_no(data["inside_bearish_fvg"])}</div></div>
-                    <div class="item"><div class="label">Inside Bullish OB</div><div class="value">{yes_no(data["inside_bullish_ob"])}</div></div>
-                    <div class="item"><div class="label">Inside Bearish OB</div><div class="value">{yes_no(data["inside_bearish_ob"])}</div></div>
-                </div>
+1. Save / Commit changes in GitHub.
+2. Wait for Render to redeploy automatically.
+3. Open the dashboard again.
+4. Test BTCUSDT on 1H and 5m.
+5. Check whether the agent now shows WATCH LONG / EARLY LONG when TradingView sees a bounce.
+6. Send a screenshot for review.
 
-                <h3>SMC Notes</h3>
-                {smc_notes_html}
-            </div>
+Repo:
+https://github.com/marinerpmv-del/trading-agent-webhook
 
-            <div class="card">
-                <h2>Market Metrics</h2>
-                <div class="grid">
-                    <div class="item"><div class="label">EMA 50</div><div class="value">{fmt(data["ema50"])}</div></div>
-                    <div class="item"><div class="label">EMA 200</div><div class="value">{fmt(data["ema200"])}</div></div>
-                    <div class="item"><div class="label">RSI 14</div><div class="value">{fmt(data["rsi14"])}</div></div>
-                    <div class="item"><div class="label">ATR 14</div><div class="value">{fmt(data["atr14"])}</div></div>
-                    <div class="item"><div class="label">Distance From EMA50</div><div class="value">{fmt(data["distance_from_ema50_atr"])} ATR</div></div>
-                    <div class="item"><div class="label">Distance From EMA50 %</div><div class="value">{fmt(data["distance_from_ema50_pct"])}%</div></div>
-                    <div class="item"><div class="label">Volume Strong</div><div class="value">{yes_no(data["volume_strong"])}</div></div>
-                </div>
-            </div>
-
-            <div class="card">
-                <h2>Trade Plan Estimate</h2>
-                <div class="grid">
-                    <div class="item"><div class="label">Entry Estimate</div><div class="value">{fmt(data["entry"])}</div></div>
-                    <div class="item"><div class="label">Stop Loss</div><div class="value">{fmt(data["stop_loss"])}</div></div>
-                    <div class="item"><div class="label">TP1</div><div class="value">{fmt(data["tp1"])}</div></div>
-                    <div class="item"><div class="label">TP2</div><div class="value">{fmt(data["tp2"])}</div></div>
-                    <div class="item"><div class="label">TP3</div><div class="value">{fmt(data["tp3"])}</div></div>
-                    <div class="item"><div class="label">Potential Move</div><div class="value">{fmt(data["potential_pct"])}%</div></div>
-                    <div class="item"><div class="label">Suggested Position</div><div class="value">{html.escape(data["suggested_position"])}</div></div>
-                    <div class="item"><div class="label">Suggested Leverage</div><div class="value">{html.escape(data["suggested_leverage"])}</div></div>
-                </div>
-            </div>
-
-            <div class="card">
-                <p>Updated UTC: {html.escape(data["updated_at"])}</p>
-                <p>Raw JSON: <a href="/bybit/analyze/{html.escape(data["symbol"])}?interval={html.escape(data["interval"])}&ai=true">Open analysis JSON with AI</a></p>
-                <p>AI JSON: <a href="/bybit/ai/{html.escape(data["symbol"])}?interval={html.escape(data["interval"])}">Open AI analysis JSON</a></p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-
-    return html_page
-
-
-@app.get("/chart", response_class=HTMLResponse)
-def visual_chart(symbol: str = "BTCUSDT", interval: str = "60"):
-    symbol = symbol.upper()
-
-    data = analyze_market(symbol=symbol, interval=interval)
-
-    if data["status"] != "ok":
-        return f"""
-        <html>
-        <body>
-            <h1>Trading Agent Chart</h1>
-            <p>Error: {html.escape(str(data.get("message")))}</p>
-        </body>
-        </html>
-        """
-
-    ai_brief = generate_ai_market_brief(data)
-    log_ai_decision(data, ai_brief)
-
-    chart_payload = prepare_chart_payload(symbol=symbol, interval=interval, limit=220)
-
-    interval_options_html = interval_select_html(interval)
-    symbol_datalist = symbol_datalist_html()
-    interval_display = interval_label(interval)
-
-    candles_json = json.dumps(chart_payload["candles"])
-    ema50_json = json.dumps(chart_payload["ema50"])
-    ema200_json = json.dumps(chart_payload["ema200"])
-
-    levels = {
-        "entry": data.get("entry"),
-        "stop_loss": data.get("stop_loss"),
-        "tp1": data.get("tp1"),
-        "tp2": data.get("tp2"),
-        "tp3": data.get("tp3"),
-        "ema50": data.get("ema50"),
-        "ema200": data.get("ema200"),
-    }
-
-    levels_json = json.dumps(levels)
-
-    ai_text = html.escape(ai_brief.get("brief", "")).replace("\n", "<br>")
-
-    if data["decision"] in ["SMART LONG", "LONG BIAS"]:
-        badge_color = "#16a34a"
-    elif data["decision"] in ["SMART SHORT", "SHORT BIAS"]:
-        badge_color = "#dc2626"
-    elif data["decision"] == "DO NOT CHASE":
-        badge_color = "#7c3aed"
-    else:
-        badge_color = "#64748b"
-
-    page = f"""
-    <html>
-    <head>
-        <title>Trading Agent Visual Chart</title>
-        <meta http-equiv="refresh" content="60">
-        <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
-        <style>
-            body {{
-                margin: 0;
-                font-family: Arial, sans-serif;
-                background: #0f172a;
-                color: #e5e7eb;
-            }}
-            .layout {{
-                display: grid;
-                grid-template-columns: minmax(0, 2fr) 420px;
-                min-height: 100vh;
-            }}
-            .chart-side {{
-                padding: 18px;
-            }}
-            .panel-side {{
-                border-left: 1px solid #334155;
-                background: #111827;
-                padding: 18px;
-                overflow-y: auto;
-            }}
-            #chart {{
-                width: 100%;
-                height: calc(100vh - 130px);
-                min-height: 520px;
-                background: #0b1220;
-                border: 1px solid #334155;
-                border-radius: 16px;
-            }}
-            .topbar {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 14px;
-                gap: 12px;
-            }}
-            .title {{
-                font-size: 24px;
-                font-weight: bold;
-            }}
-            .badge {{
-                background: {badge_color};
-                padding: 10px 14px;
-                border-radius: 12px;
-                font-weight: bold;
-                color: white;
-            }}
-            .card {{
-                background: #0f172a;
-                border: 1px solid #334155;
-                border-radius: 14px;
-                padding: 14px;
-                margin-bottom: 14px;
-            }}
-            .label {{
-                color: #94a3b8;
-                font-size: 12px;
-            }}
-            .value {{
-                font-size: 18px;
-                font-weight: bold;
-                margin-top: 3px;
-            }}
-            .grid {{
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 10px;
-            }}
-            .ai {{
-                background: #020617;
-                border-left: 4px solid #38bdf8;
-                padding: 12px;
-                border-radius: 10px;
-                line-height: 1.55;
-                font-size: 14px;
-            }}
-            .small {{
-                color: #94a3b8;
-                font-size: 12px;
-            }}
-            a {{
-                color: #60a5fa;
-            }}
-            .legend {{
-                display: flex;
-                gap: 12px;
-                flex-wrap: wrap;
-                margin-top: 10px;
-                font-size: 13px;
-                color: #cbd5e1;
-            }}
-            .controls {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 10px;
-                align-items: end;
-                margin: 10px 0 14px 0;
-                background: #111827;
-                border: 1px solid #334155;
-                border-radius: 14px;
-                padding: 12px;
-            }}
-            .control-group {{
-                display: flex;
-                flex-direction: column;
-                gap: 5px;
-            }}
-            input, select, button {{
-                background: #020617;
-                color: #e5e7eb;
-                border: 1px solid #475569;
-                border-radius: 10px;
-                padding: 8px 10px;
-                font-size: 14px;
-            }}
-            button {{
-                background: #2563eb;
-                border-color: #2563eb;
-                cursor: pointer;
-                font-weight: bold;
-            }}
-            .dot {{
-                display: inline-block;
-                width: 10px;
-                height: 10px;
-                border-radius: 99px;
-                margin-right: 5px;
-            }}
-            @media (max-width: 1000px) {{
-                .layout {{
-                    grid-template-columns: 1fr;
-                }}
-                .panel-side {{
-                    border-left: none;
-                    border-top: 1px solid #334155;
-                }}
-                #chart {{
-                    height: 560px;
-                }}
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="layout">
-            <div class="chart-side">
-                <div class="topbar">
-                    <div>
-                        <div class="title">{html.escape(symbol)} Visual Agent Chart</div>
-                        <div class="small">Timeframe: {html.escape(interval_display)} | Updated UTC: {html.escape(data["updated_at"])}</div>
-                    </div>
-                    <div class="badge">{html.escape(data["decision"])} / {html.escape(data["action"])}</div>
-                </div>
-
-                <form class="controls" method="get" action="/chart">
-                    <div class="control-group">
-                        <label class="label" for="symbol">Symbol</label>
-                        <input id="symbol" name="symbol" list="symbols" value="{html.escape(symbol)}" autocomplete="off">
-                        <datalist id="symbols">{symbol_datalist}</datalist>
-                    </div>
-                    <div class="control-group">
-                        <label class="label" for="interval">Timeframe</label>
-                        <select id="interval" name="interval">{interval_options_html}</select>
-                    </div>
-                    <button type="submit">Update Chart</button>
-                    <a href="/dashboard?symbol={html.escape(symbol)}&interval={html.escape(interval)}">Open Dashboard</a>
-                </form>
-
-                <div id="chart"></div>
-
-                <div class="legend">
-                    <span><span class="dot" style="background:#38bdf8;"></span>EMA50</span>
-                    <span><span class="dot" style="background:#f59e0b;"></span>EMA200</span>
-                    <span><span class="dot" style="background:#ffffff;"></span>Entry</span>
-                    <span><span class="dot" style="background:#ef4444;"></span>Stop Loss</span>
-                    <span><span class="dot" style="background:#22c55e;"></span>Take Profits</span>
-                </div>
-            </div>
-
-            <div class="panel-side">
-                <div class="card">
-                    <h2>Agent Decision</h2>
-                    <div class="grid">
-                        <div>
-                            <div class="label">Price</div>
-                            <div class="value">{fmt_number(data["price"])}</div>
-                        </div>
-                        <div>
-                            <div class="label">Trend</div>
-                            <div class="value">{html.escape(data["trend"])}</div>
-                        </div>
-                        <div>
-                            <div class="label">Bias</div>
-                            <div class="value">{html.escape(data["bias"])}</div>
-                        </div>
-                        <div>
-                            <div class="label">PD Zone</div>
-                            <div class="value">{html.escape(data["pd_zone"])}</div>
-                        </div>
-                    </div>
-                    <p>{html.escape(data["reason"])}</p>
-                </div>
-
-                <div class="card">
-                    <h2>Scores</h2>
-                    <div class="grid">
-                        <div>
-                            <div class="label">SMC</div>
-                            <div class="value">{data["smc_score"]}/50</div>
-                        </div>
-                        <div>
-                            <div class="label">Technical</div>
-                            <div class="value">{data["technical_score"]}/35</div>
-                        </div>
-                        <div>
-                            <div class="label">Risk</div>
-                            <div class="value">{data["risk_score"]}/15</div>
-                        </div>
-                        <div>
-                            <div class="label">Total</div>
-                            <div class="value">{data["total_score"]}/100</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <h2>Trade Plan Levels</h2>
-                    <div class="grid">
-                        <div>
-                            <div class="label">Entry</div>
-                            <div class="value">{fmt_number(data["entry"])}</div>
-                        </div>
-                        <div>
-                            <div class="label">Stop Loss</div>
-                            <div class="value">{fmt_number(data["stop_loss"])}</div>
-                        </div>
-                        <div>
-                            <div class="label">TP1</div>
-                            <div class="value">{fmt_number(data["tp1"])}</div>
-                        </div>
-                        <div>
-                            <div class="label">TP2</div>
-                            <div class="value">{fmt_number(data["tp2"])}</div>
-                        </div>
-                        <div>
-                            <div class="label">TP3</div>
-                            <div class="value">{fmt_number(data["tp3"])}</div>
-                        </div>
-                        <div>
-                            <div class="label">Potential</div>
-                            <div class="value">{fmt_number(data["potential_pct"])}%</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <h2>SMC Checklist</h2>
-                    <div class="grid">
-                        <div><div class="label">Structure</div><div class="value">{html.escape(data["market_structure"])}</div></div>
-                        <div><div class="label">Low Sweep</div><div class="value">{"YES" if data["low_sweep"] else "NO"}</div></div>
-                        <div><div class="label">High Sweep</div><div class="value">{"YES" if data["high_sweep"] else "NO"}</div></div>
-                        <div><div class="label">Bull FVG</div><div class="value">{"YES" if data["inside_bullish_fvg"] else "NO"}</div></div>
-                        <div><div class="label">Bear FVG</div><div class="value">{"YES" if data["inside_bearish_fvg"] else "NO"}</div></div>
-                        <div><div class="label">Bull OB</div><div class="value">{"YES" if data["inside_bullish_ob"] else "NO"}</div></div>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <h2>AI Market Brief</h2>
-                    <div class="ai">{ai_text}</div>
-                    <p class="small">AI status: {html.escape(str(ai_brief.get("status")))} | Model: {html.escape(str(ai_brief.get("model")))} | Updated: {html.escape(str(ai_brief.get("updated_at")))}</p>
-                </div>
-
-                <div class="card">
-                    <a href="/dashboard?symbol={html.escape(symbol)}&interval={html.escape(interval)}">Open Dashboard</a><br>
-                    <a href="/decision-log?symbol={html.escape(symbol)}&interval={html.escape(interval)}">Open Decision Log</a><br>
-                    <a href="/bybit/chart-data/{html.escape(symbol)}?interval={html.escape(interval)}">Open Chart JSON</a>
-                </div>
-            </div>
-        </div>
-
-        <script>
-            const candleData = {candles_json};
-            const ema50Data = {ema50_json};
-            const ema200Data = {ema200_json};
-            const levels = {levels_json};
-
-            const chartContainer = document.getElementById('chart');
-
-            const chart = LightweightCharts.createChart(chartContainer, {{
-                layout: {{
-                    background: {{ color: '#0b1220' }},
-                    textColor: '#d1d5db',
-                }},
-                grid: {{
-                    vertLines: {{ color: '#1f2937' }},
-                    horzLines: {{ color: '#1f2937' }},
-                }},
-                crosshair: {{
-                    mode: LightweightCharts.CrosshairMode.Normal,
-                }},
-                rightPriceScale: {{
-                    borderColor: '#374151',
-                }},
-                timeScale: {{
-                    borderColor: '#374151',
-                    timeVisible: true,
-                    secondsVisible: false,
-                }},
-            }});
-
-            const candleSeries = chart.addCandlestickSeries({{
-                upColor: '#22c55e',
-                downColor: '#ef4444',
-                borderUpColor: '#22c55e',
-                borderDownColor: '#ef4444',
-                wickUpColor: '#22c55e',
-                wickDownColor: '#ef4444',
-            }});
-
-            candleSeries.setData(candleData);
-
-            const ema50Series = chart.addLineSeries({{
-                color: '#38bdf8',
-                lineWidth: 2,
-                title: 'EMA50',
-            }});
-            ema50Series.setData(ema50Data);
-
-            const ema200Series = chart.addLineSeries({{
-                color: '#f59e0b',
-                lineWidth: 2,
-                title: 'EMA200',
-            }});
-            ema200Series.setData(ema200Data);
-
-            function addPriceLine(series, price, title, color, style = LightweightCharts.LineStyle.Solid) {{
-                if (price === null || price === undefined) return;
-                series.createPriceLine({{
-                    price: price,
-                    color: color,
-                    lineWidth: 2,
-                    lineStyle: style,
-                    axisLabelVisible: true,
-                    title: title,
-                }});
-            }}
-
-            addPriceLine(candleSeries, levels.entry, 'Entry', '#ffffff');
-            addPriceLine(candleSeries, levels.stop_loss, 'SL', '#ef4444');
-            addPriceLine(candleSeries, levels.tp1, 'TP1', '#22c55e');
-            addPriceLine(candleSeries, levels.tp2, 'TP2', '#16a34a', LightweightCharts.LineStyle.Dashed);
-            addPriceLine(candleSeries, levels.tp3, 'TP3', '#15803d', LightweightCharts.LineStyle.Dashed);
-
-            chart.timeScale().fitContent();
-
-            window.addEventListener('resize', () => {{
-                chart.applyOptions({{
-                    width: chartContainer.clientWidth,
-                    height: chartContainer.clientHeight,
-                }});
-            }});
-        </script>
-    </body>
-    </html>
-    """
-
-    return page
+main.py:
+https://github.com/marinerpmv-del/trading-agent-webhook/blob/main/main.py
